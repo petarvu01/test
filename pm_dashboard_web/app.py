@@ -869,30 +869,72 @@ elif page == "Tools":
     mc2.metric("Monthly Total", f"${total_m:,.2f}")
     mc3.metric("Annual Total", f"${total_a:,.2f}")
 
-    with st.form("add_tool"):
-        st.subheader("Add / Edit Tool")
-        tc = st.columns(3)
-        t_name = tc[0].text_input("Tool Name")
-        t_vendor = tc[1].text_input("Vendor")
-        t_cost = tc[2].number_input("Cost ($)", value=0.0, step=1.0, format="%.2f")
-        tc2 = st.columns(4)
-        t_cycle = tc2[0].selectbox("Billing Cycle",
-                                    ["Monthly", "Annual", "2-Year", "One-time"])
-        t_start = tc2[1].date_input("Start Date", value=None, key="tool_start")
-        t_renew = tc2[2].checkbox("Auto-renew", value=True)
-        t_paid = tc2[3].checkbox("Paid")
-        t_notes = st.text_input("Notes")
+    # Add / Edit tool using the same input form style
+    st.subheader("Add / Edit Tool")
 
-        if st.form_submit_button("Save Tool"):
+    tool_mode = st.radio("Tool Action", ["Add New", "Edit Existing"],
+                         horizontal=True, key="tool_mode")
+
+    edit_tool_idx = None
+    selected_tool = {}
+    if tool_mode == "Edit Existing":
+        if tools:
+            edit_tool_idx = st.selectbox(
+                "Select tool to edit",
+                range(len(tools)),
+                format_func=lambda i: tools[i].get("name", f"Tool {i + 1}"),
+                key="edit_tool_idx"
+            )
+            selected_tool = tools[edit_tool_idx]
+        else:
+            st.info("No tools available to edit yet.")
+
+    cycle_options = ["Monthly", "Annual", "2-Year", "One-time"]
+    current_cycle = selected_tool.get("billing_cycle", "Monthly")
+    cycle_index = cycle_options.index(current_cycle) if current_cycle in cycle_options else 0
+
+    with st.form("tool_form"):
+        tc = st.columns(3)
+        t_name = tc[0].text_input("Tool Name", value=selected_tool.get("name", ""))
+        t_vendor = tc[1].text_input("Vendor", value=selected_tool.get("vendor", ""))
+        t_cost = tc[2].number_input("Cost ($)",
+                                     value=float(selected_tool.get("cost", 0.0)),
+                                     min_value=0.0, step=1.0, format="%.2f")
+        tc2 = st.columns(4)
+        t_cycle = tc2[0].selectbox("Billing Cycle", cycle_options, index=cycle_index)
+        t_start = tc2[1].date_input("Start Date",
+                                     value=parse_date(selected_tool.get("start_date", "")),
+                                     key=f"tool_start_{tool_mode}_{edit_tool_idx}")
+        t_renew = tc2[2].checkbox("Auto-renew", value=selected_tool.get("auto_renew", True))
+        t_paid = tc2[3].checkbox("Paid", value=selected_tool.get("paid", False))
+        t_notes = st.text_input("Notes", value=selected_tool.get("notes", ""))
+
+        submit_label = "💾 Save New Tool" if tool_mode == "Add New" else "💾 Update Tool"
+        if st.form_submit_button(submit_label):
             if t_name:
-                tools.append({
+                tool_payload = {
                     "name": t_name, "vendor": t_vendor,
                     "cost": round(t_cost, 2),
                     "billing_cycle": t_cycle,
                     "start_date": str(t_start) if t_start else "",
                     "auto_renew": t_renew, "paid": t_paid,
                     "notes": t_notes,
-                })
+                }
+
+                if tool_mode == "Edit Existing" and edit_tool_idx is not None:
+                    old_name = tools[edit_tool_idx].get("name", "")
+                    tools[edit_tool_idx] = tool_payload
+
+                    # Keep project tool assignments synced if the tool name changes
+                    if old_name and old_name != t_name:
+                        for proj in D()["project_records"].values():
+                            proj["assigned_tools"] = [
+                                t_name if assigned_tool == old_name else assigned_tool
+                                for assigned_tool in proj.get("assigned_tools", [])
+                            ]
+                else:
+                    tools.append(tool_payload)
+
                 save()
                 st.rerun()
             else:
