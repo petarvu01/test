@@ -41,7 +41,12 @@ INITIAL_PROJECTS = [
 
 
 def blank_line(name="Phase 1 - Setup"):
-    return [name, 0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # Index map:
+    # 0 name, 1 students, 2 stu rate, 3 stu hours, 4 PI rate, 5 PI hours,
+    # 6 legacy actual indirect, 7 legacy actual fringe, 8 actual travel,
+    # 9 contracted personnel, 10 contracted PI, 11 contracted indirect,
+    # 12 contracted fringe, 13 contracted travel
+    return [name, 0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 def blank_project(code, name, has_budget=False):
@@ -57,9 +62,18 @@ def blank_project(code, name, has_budget=False):
 def validate_line(line):
     if not isinstance(line, list):
         return blank_line()
-    while len(line) < 13:
+    # Migrate old 13-field rows by copying old travel into the new contracted travel slot.
+    if len(line) == 13:
+        try:
+            line.append(float(line[8]))
+        except Exception:
+            line.append(0.0)
+    while len(line) < 14:
         line.append(0.0)
-    return line[:13]
+    # Legacy actual indirect/fringe are no longer used.
+    line[6] = 0.0
+    line[7] = 0.0
+    return line[:14]
 
 
 def default_data():
@@ -140,7 +154,7 @@ def compute_master_totals(data: dict) -> dict:
             total_stu += int(row[1]) * float(row[2]) * float(row[3])
             total_pi  += float(row[4]) * float(row[5])
             if not is_red:
-                total_budget += float(row[9]) + float(row[10]) + float(row[11]) + float(row[12])
+                total_budget += float(row[9]) + float(row[10]) + float(row[11]) + float(row[12]) + float(row[13])
     return {
         "active_projects":     len(pr),
         "total_budget":        total_budget,
@@ -151,7 +165,7 @@ def compute_master_totals(data: dict) -> dict:
 
 
 def project_contracted_total(proj: dict) -> float:
-    return sum(float(r[9]) + float(r[10]) + float(r[11]) + float(r[12])
+    return sum(float(r[9]) + float(r[10]) + float(r[11]) + float(r[12]) + float(r[13])
                for r in proj.get("lines", []))
 
 

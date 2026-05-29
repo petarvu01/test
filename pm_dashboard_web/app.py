@@ -28,6 +28,27 @@ def projects_sorted():
     return sorted(D()["project_records"].keys())
 
 
+def line_value(row, idx, default=0.0):
+    """Safely read a numeric line-item value, including older saved rows."""
+    try:
+        return float(row[idx])
+    except Exception:
+        return default
+
+
+def actual_personnel_cost(row):
+    return int(line_value(row, 1)) * line_value(row, 2) * line_value(row, 3)
+
+
+def actual_pi_cost(row):
+    return line_value(row, 4) * line_value(row, 5)
+
+
+def contracted_travel_cost(row):
+    # New field is row[13]. For older saved rows, copy old travel value as a safe migration.
+    return line_value(row, 13, line_value(row, 8))
+
+
 # ─── Custom CSS ──────────────────────────────────────────────────────────
 st.markdown("""<style>
     /* ── Sidebar ────────────────────────────────────────────────────── */
@@ -263,25 +284,23 @@ elif page == "Project View":
 
     # Line items table
     st.subheader("Line Items")
-    col_names = ["Line Item", "Students", "Stu Rate", "Stu Hours",
-                 "Stu Cost", "PI Rate", "PI Hours", "PI Cost",
-                 "Indirect", "Fringe", "Travel",
-                 "Cont. Personnel", "Cont. PI", "Cont. Indirect", "Cont. Fringe"]
 
     table_data = []
     for row in proj["lines"]:
-        s, sr, sh = int(row[1]), float(row[2]), float(row[3])
-        pr2, ph = float(row[4]), float(row[5])
+        s, sr, sh = int(line_value(row, 1)), line_value(row, 2), line_value(row, 3)
+        pr2, ph = line_value(row, 4), line_value(row, 5)
         table_data.append({
             "Line Item": row[0], "Students": s,
             "Stu Rate": sr, "Stu Hours": sh,
             "Stu Cost": round(s * sr * sh, 2),
             "PI Rate": pr2, "PI Hours": ph,
             "PI Cost": round(pr2 * ph, 2),
-            "Indirect": float(row[6]), "Fringe": float(row[7]),
-            "Travel": float(row[8]),
-            "Cont. Personnel": float(row[9]), "Cont. PI": float(row[10]),
-            "Cont. Indirect": float(row[11]), "Cont. Fringe": float(row[12]),
+            "Actual Travel": line_value(row, 8),
+            "Cont. Personnel": line_value(row, 9),
+            "Cont. PI": line_value(row, 10),
+            "Cont. Indirect": line_value(row, 11),
+            "Cont. Fringe": line_value(row, 12),
+            "Cont. Travel": contracted_travel_cost(row),
         })
 
     df = pd.DataFrame(table_data)
@@ -316,28 +335,25 @@ elif page == "Project View":
     with st.form("edit_line"):
         fc = st.columns(4)
         new_name = fc[0].text_input("Name", value=row[0])
-        new_stu = fc[1].number_input("Students", value=int(row[1]), min_value=0)
-        new_sr = fc[2].number_input("Stu Rate", value=float(row[2]), min_value=0.0, step=1.0, format="%.2f")
-        new_sh = fc[3].number_input("Stu Hours", value=float(row[3]), min_value=0.0, step=0.5, format="%.1f")
+        new_stu = fc[1].number_input("Students", value=int(line_value(row, 1)), min_value=0)
+        new_sr = fc[2].number_input("Stu Rate", value=line_value(row, 2), min_value=0.0, step=1.0, format="%.2f")
+        new_sh = fc[3].number_input("Stu Hours", value=line_value(row, 3), min_value=0.0, step=0.5, format="%.1f")
         fc2 = st.columns(4)
-        new_pr = fc2[0].number_input("PI Rate", value=float(row[4]), min_value=0.0, step=1.0, format="%.2f")
-        new_ph = fc2[1].number_input("PI Hours", value=float(row[5]), min_value=0.0, step=0.5, format="%.1f")
-        new_ind = fc2[2].number_input("Indirect", value=float(row[6]), min_value=0.0, step=1.0, format="%.2f")
-        new_fri = fc2[3].number_input("Fringe", value=float(row[7]), min_value=0.0, step=1.0, format="%.2f")
+        new_pr = fc2[0].number_input("PI Rate", value=line_value(row, 4), min_value=0.0, step=1.0, format="%.2f")
+        new_ph = fc2[1].number_input("PI Hours", value=line_value(row, 5), min_value=0.0, step=0.5, format="%.1f")
+        new_trv = fc2[2].number_input("Actual Travel", value=line_value(row, 8), min_value=0.0, step=1.0, format="%.2f")
+        new_cp = fc2[3].number_input("Cont. Personnel", value=line_value(row, 9), min_value=0.0, step=1.0, format="%.2f")
         fc3 = st.columns(4)
-        new_trv = fc3[0].number_input("Travel", value=float(row[8]), min_value=0.0, step=1.0, format="%.2f")
-        new_cp = fc3[1].number_input("Cont. Personnel", value=float(row[9]), min_value=0.0, step=1.0, format="%.2f")
-        new_cpi = fc3[2].number_input("Cont. PI", value=float(row[10]), min_value=0.0, step=1.0, format="%.2f")
-        new_ci = fc3[3].number_input("Cont. Indirect", value=float(row[11]), min_value=0.0, step=1.0, format="%.2f")
-        fc4 = st.columns(4)
-        new_cf = fc4[0].number_input("Cont. Fringe", value=float(row[12]), min_value=0.0, step=1.0, format="%.2f")
+        new_cpi = fc3[0].number_input("Cont. PI", value=line_value(row, 10), min_value=0.0, step=1.0, format="%.2f")
+        new_ci = fc3[1].number_input("Cont. Indirect", value=line_value(row, 11), min_value=0.0, step=1.0, format="%.2f")
+        new_cf = fc3[2].number_input("Cont. Fringe", value=line_value(row, 12), min_value=0.0, step=1.0, format="%.2f")
+        new_ct = fc3[3].number_input("Cont. Travel", value=contracted_travel_cost(row), min_value=0.0, step=1.0, format="%.2f")
 
         if st.form_submit_button("💾 Save Changes"):
-            row[0] = new_name
-            row[1] = new_stu; row[2] = new_sr; row[3] = new_sh
-            row[4] = new_pr; row[5] = new_ph
-            row[6] = new_ind; row[7] = new_fri; row[8] = new_trv
-            row[9] = new_cp; row[10] = new_cpi; row[11] = new_ci; row[12] = new_cf
+            row[:] = [
+                new_name, new_stu, new_sr, new_sh, new_pr, new_ph,
+                0.0, 0.0, new_trv, new_cp, new_cpi, new_ci, new_cf, new_ct
+            ]
             save()
             st.success(f"Updated '{new_name}'!")
             st.rerun()
@@ -406,10 +422,10 @@ elif page == "Master View":
         is_red = proj.get("has_budget", False)
         budget = stu = pi = 0.0
         for row in proj["lines"]:
-            # Contracted budget = contracted personnel + contracted PI + contracted indirect + contracted fringe + travel
-            budget += float(row[9]) + float(row[10]) + float(row[11]) + float(row[12]) + float(row[8])
-            stu += int(row[1]) * float(row[2]) * float(row[3])
-            pi += float(row[4]) * float(row[5])
+            # Contracted budget = contracted personnel + contracted PI + contracted indirect + contracted fringe + contracted travel
+            budget += line_value(row, 9) + line_value(row, 10) + line_value(row, 11) + line_value(row, 12) + contracted_travel_cost(row)
+            stu += actual_personnel_cost(row)
+            pi += actual_pi_cost(row)
         credits = sum(s["credits"] for s in D()["student_credits"] if s["project"] == name)
         ext = proj.get("extension_date", "")
         ed = proj.get("end_date", "")
@@ -464,18 +480,18 @@ elif page == "Actual vs Budget":
         pers = pi = trv = tools_actual = 0.0
 
         for row in proj["lines"]:
-            # Contracted budget = contracted personnel + contracted PI + contracted indirect + contracted fringe + travel
-            cont_personnel += float(row[9])
-            cont_pi += float(row[10])
-            cont_indirect += float(row[11])
-            cont_fringe += float(row[12])
-            cont_travel += float(row[8])
+            # Contracted budget = contracted personnel + contracted PI + contracted indirect + contracted fringe + contracted travel
+            cont_personnel += line_value(row, 9)
+            cont_pi += line_value(row, 10)
+            cont_indirect += line_value(row, 11)
+            cont_fringe += line_value(row, 12)
+            cont_travel += contracted_travel_cost(row)
 
-            # Actual cost = personnel + PI + travel + tools
+            # Actual cost = personnel + PI + actual travel + tools.
             # Indirect and fringe are NOT included in actual/running cost.
-            pers += int(row[1]) * float(row[2]) * float(row[3])
-            pi += float(row[4]) * float(row[5])
-            trv += float(row[8])
+            pers += actual_personnel_cost(row)
+            pi += actual_pi_cost(row)
+            trv += line_value(row, 8)
 
         for tn in proj.get("assigned_tools", []):
             t = next((x for x in D()["tools"] if x.get("name") == tn), None)
@@ -500,22 +516,50 @@ elif page == "Actual vs Budget":
             "Start": fmt_date(proj.get("start_date", "")),
             "End": fmt_date(ext if ext else ed) + (" ★" if ext else ""),
             "Budget": bstr,
-            "Budget Personnel": f"${cont_personnel:,.2f}",
-            "Budget PI": f"${cont_pi:,.2f}",
-            "Budget Indirect": f"${cont_indirect:,.2f}",
-            "Budget Fringe": f"${cont_fringe:,.2f}",
-            "Budget Travel": f"${cont_travel:,.2f}",
-            "Actual Personnel": f"${pers:,.2f}",
-            "Actual PI": f"${pi:,.2f}",
-            "Actual Travel": f"${trv:,.2f}",
-            "Actual Tools": f"${tools_actual:,.2f}",
             "Actuals": f"${actuals:,.2f}",
             "Variance": var_s, "% Used": pct_s,
+            "_budget_personnel": cont_personnel,
+            "_budget_pi": cont_pi,
+            "_budget_indirect": cont_indirect,
+            "_budget_fringe": cont_fringe,
+            "_budget_travel": cont_travel,
+            "_actual_personnel": pers,
+            "_actual_pi": pi,
+            "_actual_travel": trv,
+            "_actual_tools": tools_actual,
         })
 
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        csv = pd.DataFrame(rows).to_csv(index=False)
+        display_cols = ["Code", "Project", "Start", "End", "Budget", "Actuals", "Variance", "% Used"]
+        display_df = pd.DataFrame([{k: r[k] for k in display_cols} for r in rows])
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        st.subheader("Budget Breakdown")
+        for r in rows:
+            with st.expander(f"{r['Project']} — {r['Budget']}"):
+                bdf = pd.DataFrame([
+                    {"Category": "Contracted Personnel", "Amount": f"${r['_budget_personnel']:,.2f}"},
+                    {"Category": "Contracted PI", "Amount": f"${r['_budget_pi']:,.2f}"},
+                    {"Category": "Contracted Indirect", "Amount": f"${r['_budget_indirect']:,.2f}"},
+                    {"Category": "Contracted Fringe", "Amount": f"${r['_budget_fringe']:,.2f}"},
+                    {"Category": "Contracted Travel", "Amount": f"${r['_budget_travel']:,.2f}"},
+                ])
+                adf = pd.DataFrame([
+                    {"Category": "Actual Personnel", "Amount": f"${r['_actual_personnel']:,.2f}"},
+                    {"Category": "Actual PI", "Amount": f"${r['_actual_pi']:,.2f}"},
+                    {"Category": "Actual Travel", "Amount": f"${r['_actual_travel']:,.2f}"},
+                    {"Category": "Actual Tools", "Amount": f"${r['_actual_tools']:,.2f}"},
+                ])
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**Budget components**")
+                    st.dataframe(bdf, use_container_width=True, hide_index=True)
+                with c2:
+                    st.markdown("**Actual components**")
+                    st.dataframe(adf, use_container_width=True, hide_index=True)
+
+        csv_df = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in rows])
+        csv = csv_df.to_csv(index=False)
         st.download_button("⬇️ Download CSV", csv, "actual_vs_budget.csv", "text/csv")
 
 
