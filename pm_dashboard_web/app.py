@@ -658,10 +658,10 @@ elif page == "Invoices / WO":
         else:
             default_desc = ""
 
-        num = ic[0].text_input("Number", value=default_number)
-        proj = ic[1].selectbox("Project", project_options, index=project_index, key="inv_proj")
+        num = ic[0].text_input("Number", value=default_number, key="invwo_number")
+        proj = ic[1].selectbox("Project", project_options, index=project_index, key="invwo_project")
         desc_label = "Period / Label" if form_type == "Work Order" else "Description"
-        desc = ic[2].text_input(desc_label, value=default_desc)
+        desc = ic[2].text_input(desc_label, value=default_desc, key="invwo_description")
 
         if form_type == "Invoice":
             default_amt = float(edit_rec.get("amount", 0)) if edit_rec else 0.0
@@ -675,10 +675,10 @@ elif page == "Invoices / WO":
             net_index = net_options.index(default_net) if default_net in net_options else 0
 
             ic2 = st.columns(4)
-            amt = ic2[0].number_input("Amount ($)", value=default_amt, step=1.0, format="%.2f")
-            net = ic2[1].selectbox("Net Terms", net_options, index=net_index)
+            amt = ic2[0].number_input("Amount ($)", value=default_amt, step=1.0, format="%.2f", key="invoice_amount")
+            net = ic2[1].selectbox("Net Terms", net_options, index=net_index, key="invoice_net_terms")
             due = ic2[2].date_input("Invoice Date", value=default_due, key="inv_due")
-            hrs_ded = ic2[3].number_input("Hours deducted", value=default_hrs, step=0.5, format="%.1f")
+            hrs_ded = ic2[3].number_input("Hours deducted", value=default_hrs, step=0.5, format="%.1f", key="invoice_hours_deducted")
             ic3 = st.columns(2)
             sent = ic3[0].checkbox("Sent", value=default_sent, key="inv_sent")
             paid = ic3[1].checkbox("Paid", value=default_paid, key="inv_paid")
@@ -725,9 +725,9 @@ elif page == "Invoices / WO":
                 net_index = net_options.index(default_net) if default_net in net_options else 0
 
                 ic2 = st.columns(4)
-                inst_amt = ic2[0].number_input("Amount ($)", value=default_amt, step=1.0, format="%.2f")
-                inst_net = ic2[1].selectbox("Net Terms", net_options, index=net_index, key="inst_net")
-                inst_due = ic2[2].date_input("Invoice Date", value=default_due, key="inst_due")
+                inst_amt = ic2[0].number_input("Amount ($)", value=default_amt, step=1.0, format="%.2f", key="wo_edit_amount")
+                inst_net = ic2[1].selectbox("Net Terms", net_options, index=net_index, key="wo_edit_net_terms")
+                inst_due = ic2[2].date_input("Invoice Date", value=default_due, key="wo_edit_invoice_date")
                 ic3 = st.columns(2)
                 inst_sent = ic3[0].checkbox("Sent", value=default_sent, key="wo_sent")
                 inst_paid = ic3[1].checkbox("Paid", value=default_paid, key="wo_paid")
@@ -754,10 +754,10 @@ elif page == "Invoices / WO":
                 if "wo_installments" not in st.session_state:
                     st.session_state.wo_installments = []
                 ic2 = st.columns(4)
-                period = ic2[0].text_input("Period / Label")
-                inst_amt = ic2[1].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="inst_amt")
-                inst_net = ic2[2].selectbox("Net Terms", ["Net 30", "Net 60", "Net 90", "Net 120"], key="inst_net")
-                inst_due = ic2[3].date_input("Invoice Date", value=None, key="inst_due")
+                period = ic2[0].text_input("Period / Label", key="wo_new_period")
+                inst_amt = ic2[1].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="wo_new_amount")
+                inst_net = ic2[2].selectbox("Net Terms", ["Net 30", "Net 60", "Net 90", "Net 120"], key="wo_new_net_terms")
+                inst_due = ic2[3].date_input("Invoice Date", value=None, key="wo_new_invoice_date")
                 add_inst = st.form_submit_button("➕ Add Installment")
                 save_wo = st.form_submit_button("💾 Save Work Order")
 
