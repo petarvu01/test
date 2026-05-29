@@ -540,25 +540,96 @@ elif page == "Invoices / WO":
     proj_filter = fc2.selectbox("Filter project", ["All"] + projects_sorted(), key="inv_proj_f")
     inv_type = fc3.radio("Type", ["Invoice", "Work Order"], horizontal=True)
 
-    with st.form("add_inv"):
-        st.subheader(f"Add {inv_type}")
+    # Build the current flat list before the form so the same input area can edit existing rows.
+    flat = flat_invoice_rows(D(), show_hist=show_hist, proj_filter=proj_filter)
+
+    action_mode = st.radio(
+        "Action",
+        ["Add New", "Edit Existing"],
+        horizontal=True,
+        key="invoice_action_mode",
+        disabled=not bool(flat),
+    )
+    if not flat:
+        action_mode = "Add New"
+
+    edit_row = edit_rec = edit_inst = None
+    form_type = inv_type
+    if action_mode == "Edit Existing" and flat:
+        edit_pick = st.number_input(
+            "Row # to edit (from table below)",
+            min_value=1,
+            max_value=len(flat),
+            value=1,
+            key="invoice_edit_row_picker",
+        )
+        edit_row = flat[edit_pick - 1]
+        edit_rec = edit_row["_rec"]
+        edit_inst = edit_row["_inst"]
+        form_type = edit_row["type"]
+        st.caption(f"Editing row {edit_pick}: {form_type} #{edit_row['number']} — {edit_row['project']}")
+
+    with st.form("add_edit_inv"):
+        st.subheader(f"{'Edit' if action_mode == 'Edit Existing' else 'Add'} {form_type}")
         ic = st.columns(3)
-        num = ic[0].text_input("Number")
-        proj = ic[1].selectbox("Project", projects_sorted(), key="inv_proj")
-        desc = ic[2].text_input("Description")
 
-        if inv_type == "Invoice":
+        default_number = edit_rec.get("number", "") if edit_rec else ""
+        default_project = edit_rec.get("project", "") if edit_rec else ""
+        project_options = projects_sorted()
+        project_index = project_options.index(default_project) if default_project in project_options else 0
+
+        if action_mode == "Edit Existing" and edit_inst is not None:
+            default_desc = edit_inst.get("period", edit_row.get("description", ""))
+        elif action_mode == "Edit Existing" and edit_rec is not None:
+            default_desc = edit_rec.get("description", "")
+        else:
+            default_desc = ""
+
+        num = ic[0].text_input("Number", value=default_number)
+        proj = ic[1].selectbox("Project", project_options, index=project_index, key="inv_proj")
+        desc_label = "Period / Label" if form_type == "Work Order" else "Description"
+        desc = ic[2].text_input(desc_label, value=default_desc)
+
+        if form_type == "Invoice":
+            default_amt = float(edit_rec.get("amount", 0)) if edit_rec else 0.0
+            default_net = edit_rec.get("net_terms", "Net 30") if edit_rec else "Net 30"
+            default_due = parse_date(edit_rec.get("due_date", "")) if edit_rec else None
+            default_hrs = float(edit_rec.get("hours_deducted") or 0) if edit_rec else 0.0
+            default_sent = bool(edit_rec.get("sent", False)) if edit_rec else False
+            default_paid = bool(edit_rec.get("paid", False)) if edit_rec else False
+
+            net_options = ["Net 30", "Net 60", "Net 90", "Net 120"]
+            net_index = net_options.index(default_net) if default_net in net_options else 0
+
             ic2 = st.columns(4)
-            amt = ic2[0].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f")
-            net = ic2[1].selectbox("Net Terms", ["Net 30", "Net 60", "Net 90", "Net 120"])
-            due = ic2[2].date_input("Due Date", value=None, key="inv_due")
-            hrs_ded = ic2[3].number_input("Hours deducted", value=0.0, step=0.5, format="%.1f")
+            amt = ic2[0].number_input("Amount ($)", value=default_amt, step=1.0, format="%.2f")
+            net = ic2[1].selectbox("Net Terms", net_options, index=net_index)
+            due = ic2[2].date_input("Invoice Date", value=default_due, key="inv_due")
+            hrs_ded = ic2[3].number_input("Hours deducted", value=default_hrs, step=0.5, format="%.1f")
             ic3 = st.columns(2)
-            sent = ic3[0].checkbox("Sent", key="inv_sent")
-            paid = ic3[1].checkbox("Paid", key="inv_paid")
+            sent = ic3[0].checkbox("Sent", value=default_sent, key="inv_sent")
+            paid = ic3[1].checkbox("Paid", value=default_paid, key="inv_paid")
 
-            if st.form_submit_button("Save Invoice"):
-                if num:
+            submit_invoice = st.form_submit_button(
+                "💾 Save Invoice Changes" if action_mode == "Edit Existing" else "💾 Save Invoice"
+            )
+            if submit_invoice:
+                if not num:
+                    st.error("Number is required.")
+                elif action_mode == "Edit Existing" and edit_rec is not None:
+                    edit_rec["number"] = num
+                    edit_rec["project"] = proj
+                    edit_rec["description"] = desc
+                    edit_rec["amount"] = round(amt, 2)
+                    edit_rec["net_terms"] = net
+                    edit_rec["due_date"] = str(due) if due else ""
+                    edit_rec["hours_deducted"] = hrs_ded if hrs_ded else ""
+                    edit_rec["sent"] = sent
+                    edit_rec["paid"] = paid
+                    save()
+                    st.success("Invoice updated!")
+                    st.rerun()
+                else:
                     D()["invoices"].append({
                         "type": "Invoice", "number": num, "project": proj,
                         "description": desc, "amount": round(amt, 2),
@@ -567,50 +638,85 @@ elif page == "Invoices / WO":
                         "sent": sent, "paid": paid,
                     })
                     save()
-                    # Check WO vs contracted
                     st.rerun()
-                else:
-                    st.error("Number is required.")
-        else:
-            st.markdown("**Add installments below, then click Save Work Order.**")
-            if "wo_installments" not in st.session_state:
-                st.session_state.wo_installments = []
-            ic2 = st.columns(4)
-            period = ic2[0].text_input("Period / Label")
-            inst_amt = ic2[1].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="inst_amt")
-            inst_net = ic2[2].selectbox("Net Terms", ["Net 30", "Net 60", "Net 90", "Net 120"], key="inst_net")
-            inst_due = ic2[3].date_input("Due Date", value=None, key="inst_due")
-            add_inst = st.form_submit_button("➕ Add Installment")
-            save_wo = st.form_submit_button("💾 Save Work Order")
 
-        if inv_type == "Work Order":
-            if add_inst and period:
-                st.session_state.wo_installments.append({
-                    "period": period, "amount": round(inst_amt, 2),
-                    "net_terms": inst_net,
-                    "due_date": str(inst_due) if inst_due else "",
-                    "sent": False, "paid": False,
-                })
-                st.rerun()
-            if save_wo and num:
-                if st.session_state.wo_installments:
-                    D()["invoices"].append({
-                        "type": "Work Order", "number": num, "project": proj,
-                        "description": desc,
-                        "installments": list(st.session_state.wo_installments),
-                    })
-                    wo_t = sum(i["amount"] for i in st.session_state.wo_installments)
-                    contracted = project_contracted_total(D()["project_records"].get(proj, {}))
-                    save()
+        else:
+            if action_mode == "Edit Existing" and edit_inst is not None:
+                default_amt = float(edit_inst.get("amount", 0))
+                default_net = edit_inst.get("net_terms", "Net 30")
+                default_due = parse_date(edit_inst.get("due_date", ""))
+                default_sent = bool(edit_inst.get("sent", False))
+                default_paid = bool(edit_inst.get("paid", False))
+
+                net_options = ["Net 30", "Net 60", "Net 90", "Net 120"]
+                net_index = net_options.index(default_net) if default_net in net_options else 0
+
+                ic2 = st.columns(4)
+                inst_amt = ic2[0].number_input("Amount ($)", value=default_amt, step=1.0, format="%.2f")
+                inst_net = ic2[1].selectbox("Net Terms", net_options, index=net_index, key="inst_net")
+                inst_due = ic2[2].date_input("Invoice Date", value=default_due, key="inst_due")
+                ic3 = st.columns(2)
+                inst_sent = ic3[0].checkbox("Sent", value=default_sent, key="wo_sent")
+                inst_paid = ic3[1].checkbox("Paid", value=default_paid, key="wo_paid")
+
+                save_wo_edit = st.form_submit_button("💾 Save Work Order Changes")
+                if save_wo_edit:
+                    if not num:
+                        st.error("Number is required.")
+                    else:
+                        edit_rec["number"] = num
+                        edit_rec["project"] = proj
+                        edit_rec["description"] = edit_rec.get("description", "")
+                        edit_inst["period"] = desc
+                        edit_inst["amount"] = round(inst_amt, 2)
+                        edit_inst["net_terms"] = inst_net
+                        edit_inst["due_date"] = str(inst_due) if inst_due else ""
+                        edit_inst["sent"] = inst_sent
+                        edit_inst["paid"] = inst_paid
+                        save()
+                        st.success("Work order installment updated!")
+                        st.rerun()
+            else:
+                st.markdown("**Add installments below, then click Save Work Order.**")
+                if "wo_installments" not in st.session_state:
                     st.session_state.wo_installments = []
-                    if abs(wo_t - contracted) > 0.01 and (wo_t > 0 or contracted > 0):
-                        st.warning(f"⚠️ WO total ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f}")
+                ic2 = st.columns(4)
+                period = ic2[0].text_input("Period / Label")
+                inst_amt = ic2[1].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="inst_amt")
+                inst_net = ic2[2].selectbox("Net Terms", ["Net 30", "Net 60", "Net 90", "Net 120"], key="inst_net")
+                inst_due = ic2[3].date_input("Invoice Date", value=None, key="inst_due")
+                add_inst = st.form_submit_button("➕ Add Installment")
+                save_wo = st.form_submit_button("💾 Save Work Order")
+
+                if add_inst and period:
+                    st.session_state.wo_installments.append({
+                        "period": period, "amount": round(inst_amt, 2),
+                        "net_terms": inst_net,
+                        "due_date": str(inst_due) if inst_due else "",
+                        "sent": False, "paid": False,
+                    })
                     st.rerun()
-                else:
-                    st.error("Add at least one installment.")
+                if save_wo and num:
+                    if st.session_state.wo_installments:
+                        D()["invoices"].append({
+                            "type": "Work Order", "number": num, "project": proj,
+                            "description": desc,
+                            "installments": list(st.session_state.wo_installments),
+                        })
+                        wo_t = sum(i["amount"] for i in st.session_state.wo_installments)
+                        contracted = project_contracted_total(D()["project_records"].get(proj, {}))
+                        save()
+                        st.session_state.wo_installments = []
+                        if abs(wo_t - contracted) > 0.01 and (wo_t > 0 or contracted > 0):
+                            st.warning(f"⚠️ WO total ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f}")
+                        st.rerun()
+                    else:
+                        st.error("Add at least one installment.")
+                elif save_wo and not num:
+                    st.error("Number is required.")
 
     # Show staged installments
-    if inv_type == "Work Order" and st.session_state.get("wo_installments"):
+    if form_type == "Work Order" and action_mode == "Add New" and st.session_state.get("wo_installments"):
         st.markdown("**Staged installments:**")
         inst_df = pd.DataFrame(st.session_state.wo_installments)
         st.dataframe(inst_df, use_container_width=True, hide_index=True)
@@ -634,6 +740,7 @@ elif page == "Invoices / WO":
                 "Terms": r["net_terms"],
                 "Invoice Date": fmt_date(r["due_date"]),
                 "Payment Due": fmt_date(r["payment_due"]),
+                "Hours Deducted": r.get("hours_deducted", "") if r["type"] == "Invoice" else "",
                 "Sent": "☑" if r["sent"] else "☐",
                 "Paid": "☑" if r["paid"] else "☐",
             })
@@ -668,124 +775,11 @@ elif page == "Invoices / WO":
             save()
             st.rerun()
 
-        # Edit selected invoice / work order row
-        with st.expander("✏️ Edit Selected Row", expanded=False):
-            edit_idx = st.number_input(
-                "Row # to edit (1-based)",
-                min_value=1,
-                max_value=len(flat),
-                value=1,
-                key="edit_invoice_row_idx",
-            )
-            edit_row = flat[edit_idx - 1]
-            edit_rec = edit_row["_rec"]
-            edit_inst = edit_row["_inst"]
-
-            with st.form("edit_invoice_wo_row"):
-                ec1, ec2, ec3 = st.columns(3)
-                edit_number = ec1.text_input("Number", value=edit_rec.get("number", ""))
-                edit_project = ec2.selectbox(
-                    "Project",
-                    projects_sorted(),
-                    index=projects_sorted().index(edit_rec.get("project", ""))
-                    if edit_rec.get("project", "") in projects_sorted() else 0,
-                    key="edit_invoice_project",
-                )
-
-                if edit_inst is not None:
-                    edit_description = ec3.text_input(
-                        "Period / Label",
-                        value=edit_inst.get("period", edit_row.get("description", "")),
-                    )
-                    ec4, ec5, ec6 = st.columns(3)
-                    edit_amount = ec4.number_input(
-                        "Amount ($)",
-                        value=float(edit_inst.get("amount", 0)),
-                        min_value=0.0,
-                        step=1.0,
-                        format="%.2f",
-                    )
-                    edit_terms = ec5.selectbox(
-                        "Net Terms",
-                        ["Net 30", "Net 60", "Net 90", "Net 120"],
-                        index=["Net 30", "Net 60", "Net 90", "Net 120"].index(edit_inst.get("net_terms", "Net 30"))
-                        if edit_inst.get("net_terms", "Net 30") in ["Net 30", "Net 60", "Net 90", "Net 120"] else 0,
-                        key="edit_wo_terms",
-                    )
-                    edit_due = ec6.date_input(
-                        "Invoice Date",
-                        value=parse_date(edit_inst.get("due_date", "")),
-                        key="edit_wo_due",
-                    )
-                    ec7, ec8 = st.columns(2)
-                    edit_sent = ec7.checkbox("Sent", value=bool(edit_inst.get("sent", False)), key="edit_wo_sent")
-                    edit_paid = ec8.checkbox("Paid", value=bool(edit_inst.get("paid", False)), key="edit_wo_paid")
-                else:
-                    edit_description = ec3.text_input("Description", value=edit_rec.get("description", ""))
-                    ec4, ec5, ec6, ec7 = st.columns(4)
-                    edit_amount = ec4.number_input(
-                        "Amount ($)",
-                        value=float(edit_rec.get("amount", 0)),
-                        min_value=0.0,
-                        step=1.0,
-                        format="%.2f",
-                    )
-                    edit_terms = ec5.selectbox(
-                        "Net Terms",
-                        ["Net 30", "Net 60", "Net 90", "Net 120"],
-                        index=["Net 30", "Net 60", "Net 90", "Net 120"].index(edit_rec.get("net_terms", "Net 30"))
-                        if edit_rec.get("net_terms", "Net 30") in ["Net 30", "Net 60", "Net 90", "Net 120"] else 0,
-                        key="edit_inv_terms",
-                    )
-                    edit_due = ec6.date_input(
-                        "Invoice Date",
-                        value=parse_date(edit_rec.get("due_date", "")),
-                        key="edit_inv_due",
-                    )
-                    edit_hours = ec7.number_input(
-                        "Hours deducted",
-                        value=float(edit_rec.get("hours_deducted") or 0),
-                        min_value=0.0,
-                        step=0.5,
-                        format="%.1f",
-                    )
-                    ec8, ec9 = st.columns(2)
-                    edit_sent = ec8.checkbox("Sent", value=bool(edit_rec.get("sent", False)), key="edit_inv_sent")
-                    edit_paid = ec9.checkbox("Paid", value=bool(edit_rec.get("paid", False)), key="edit_inv_paid")
-
-                if st.form_submit_button("💾 Save Row Changes"):
-                    if not edit_number:
-                        st.error("Number is required.")
-                    else:
-                        edit_rec["number"] = edit_number
-                        edit_rec["project"] = edit_project
-
-                        if edit_inst is not None:
-                            edit_inst["period"] = edit_description
-                            edit_inst["amount"] = round(edit_amount, 2)
-                            edit_inst["net_terms"] = edit_terms
-                            edit_inst["due_date"] = str(edit_due) if edit_due else ""
-                            edit_inst["sent"] = edit_sent
-                            edit_inst["paid"] = edit_paid
-                        else:
-                            edit_rec["description"] = edit_description
-                            edit_rec["amount"] = round(edit_amount, 2)
-                            edit_rec["net_terms"] = edit_terms
-                            edit_rec["due_date"] = str(edit_due) if edit_due else ""
-                            edit_rec["hours_deducted"] = edit_hours if edit_hours else ""
-                            edit_rec["sent"] = edit_sent
-                            edit_rec["paid"] = edit_paid
-
-                        save()
-                        st.success("Row updated!")
-                        st.rerun()
-
         # CSV export
         csv = pd.DataFrame(display_rows).to_csv(index=False)
         st.download_button("⬇️ Export CSV", csv, "invoices_wo.csv", "text/csv")
 
 
-# ═════════════════════════════════════════════════════════════════════════
 # HOURS
 # ═════════════════════════════════════════════════════════════════════════
 elif page == "Hours":
