@@ -36,6 +36,11 @@ def line_value(row, idx, default=0.0):
         return default
 
 
+def num(v, cast=float):
+    """Coerce a (possibly NaN/blank) data_editor cell to a number."""
+    return cast(v) if pd.notna(v) else cast(0)
+
+
 def actual_personnel_cost(row):
     return int(line_value(row, 1)) * line_value(row, 2) * line_value(row, 3)
 
@@ -47,6 +52,19 @@ def actual_pi_cost(row):
 def contracted_travel_cost(row):
     # New field is row[13]. For older saved rows, copy old travel value as a safe migration.
     return line_value(row, 13, line_value(row, 8))
+
+
+def filtered_projects(search, fy):
+    """Yield (name, proj) for projects matching the search text and fiscal year.
+    Shared by Master View and Actual vs Budget so the two can't drift apart."""
+    s = (search or "").lower()
+    for name in sorted(D()["project_records"].keys()):
+        proj = D()["project_records"][name]
+        if s and s not in name.lower() and s not in proj["code"].lower():
+            continue
+        if not project_in_fy(proj, fy):
+            continue
+        yield name, proj
 
 
 # ─── Custom CSS ──────────────────────────────────────────────────────────
@@ -125,7 +143,7 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown('<hr style="border: none; border-top: 1px solid #1e293b; margin: 0 0 12px;">', 
+    st.markdown('<hr style="border: none; border-top: 1px solid #1e293b; margin: 0 0 12px;">',
                 unsafe_allow_html=True)
 
     st.markdown('<div style="font-size: 10px; font-weight: 500; color: #334155 !important; '
@@ -226,12 +244,24 @@ elif page == "Project View":
     with col3:
         if st.button("🗑️ Remove Project", type="secondary"):
             if len(projects) > 1:
-                del pr[active]
-                D()["student_credits"] = [s for s in D()["student_credits"] if s["project"] != active]
-                save()
-                st.rerun()
+                st.session_state.confirm_del_proj = True
             else:
                 st.error("Must keep at least one project.")
+
+    # Confirm-gate for project deletion (prevents one-click data loss)
+    if st.session_state.get("confirm_del_proj"):
+        st.warning(f"Delete **{active}** and its student credits? This can't be undone.")
+        dc1, dc2, _ = st.columns([1, 1, 4])
+        if dc1.button("Yes, delete", type="primary"):
+            del pr[active]
+            D()["student_credits"] = [s for s in D()["student_credits"] if s["project"] != active]
+            st.session_state.confirm_del_proj = False
+            save()
+            st.toast(f"Removed {active}")
+            st.rerun()
+        if dc2.button("Cancel"):
+            st.session_state.confirm_del_proj = False
+            st.rerun()
 
     # Add project dialog
     if st.session_state.get("show_add_project"):
@@ -252,6 +282,7 @@ elif page == "Project View":
                         pr[new_name] = p
                         save()
                         st.session_state.show_add_project = False
+                        st.toast(f"Created {new_name}")
                         st.rerun()
                     else:
                         st.error(f"'{new_name}' already exists.")
@@ -267,11 +298,11 @@ elif page == "Project View":
     st.subheader("Project Dates")
     dc1, dc2, dc3, dc4 = st.columns([2, 2, 2, 1])
     sd = dc1.date_input("Start Date", value=parse_date(proj.get("start_date", "")),
-                         key="proj_start", format="YYYY-MM-DD")
+                        key="proj_start", format="YYYY-MM-DD")
     ed = dc2.date_input("End Date", value=parse_date(proj.get("end_date", "")),
-                         key="proj_end", format="YYYY-MM-DD")
+                        key="proj_end", format="YYYY-MM-DD")
     ext = dc3.date_input("Extension", value=parse_date(proj.get("extension_date", "")),
-                          key="proj_ext", format="YYYY-MM-DD")
+                         key="proj_ext", format="YYYY-MM-DD")
     no_budget = dc4.checkbox("No Budget", value=proj.get("has_budget", False), key="nb_chk")
 
     if st.button("💾 Save Dates"):
@@ -280,83 +311,74 @@ elif page == "Project View":
         proj["extension_date"] = str(ext) if ext else ""
         proj["has_budget"] = no_budget
         save()
-        st.success("Dates saved!")
+        st.toast("Dates saved")
 
-    # Line items table
+    # ── Line items (editable grid) ─────────────────────────────────────
     st.subheader("Line Items")
+    st.caption("Edit any cell directly. Use the **＋** at the bottom of the grid to add a "
+               "line, or tick a row's checkbox and press your keyboard Delete to remove it — "
+               "then click Save Line Items.")
 
-    table_data = []
+    edit_df = pd.DataFrame([{
+        "Line Item": row[0],
+        "Students": int(line_value(row, 1)),
+        "Stu Rate": line_value(row, 2),
+        "Stu Hours": line_value(row, 3),
+        "PI Rate": line_value(row, 4),
+        "PI Hours": line_value(row, 5),
+        "Actual Travel": line_value(row, 8),
+        "Cont. Personnel": line_value(row, 9),
+        "Cont. PI": line_value(row, 10),
+        "Cont. Indirect": line_value(row, 11),
+        "Cont. Fringe": line_value(row, 12),
+        "Cont. Travel": contracted_travel_cost(row),
+    } for row in proj["lines"]])
+
+    money = st.column_config.NumberColumn(min_value=0.0, step=1.0, format="$%.2f")
+    hours = st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f")
+    edited = st.data_editor(
+        edit_df, use_container_width=True, hide_index=True,
+        num_rows="dynamic", key=f"lines_editor_{active}",
+        column_config={
+            "Line Item": st.column_config.TextColumn(required=True, width="medium"),
+            "Students": st.column_config.NumberColumn(min_value=0, step=1),
+            "Stu Rate": money, "Stu Hours": hours,
+            "PI Rate": money, "PI Hours": hours,
+            "Actual Travel": money, "Cont. Personnel": money, "Cont. PI": money,
+            "Cont. Indirect": money, "Cont. Fringe": money, "Cont. Travel": money,
+        },
+    )
+
+    if st.button("💾 Save Line Items"):
+        new_lines = [[
+            (r["Line Item"] or "Untitled"),
+            num(r["Students"], int), num(r["Stu Rate"]), num(r["Stu Hours"]),
+            num(r["PI Rate"]), num(r["PI Hours"]),
+            0.0, 0.0, num(r["Actual Travel"]),
+            num(r["Cont. Personnel"]), num(r["Cont. PI"]),
+            num(r["Cont. Indirect"]), num(r["Cont. Fringe"]), num(r["Cont. Travel"]),
+        ] for _, r in edited.iterrows()]
+        proj["lines"] = new_lines or [blank_line()]
+        save()
+        st.toast("Line items saved")
+        st.rerun()
+
+    # Read-only computed recap (reflects the last saved state)
+    recap = []
     for row in proj["lines"]:
         s, sr, sh = int(line_value(row, 1)), line_value(row, 2), line_value(row, 3)
         pr2, ph = line_value(row, 4), line_value(row, 5)
-        table_data.append({
-            "Line Item": row[0], "Students": s,
-            "Stu Rate": sr, "Stu Hours": sh,
-            "Stu Cost": round(s * sr * sh, 2),
-            "PI Rate": pr2, "PI Hours": ph,
-            "PI Cost": round(pr2 * ph, 2),
-            "Actual Travel": line_value(row, 8),
-            "Cont. Personnel": line_value(row, 9),
-            "Cont. PI": line_value(row, 10),
-            "Cont. Indirect": line_value(row, 11),
-            "Cont. Fringe": line_value(row, 12),
-            "Cont. Travel": contracted_travel_cost(row),
+        cont = (line_value(row, 9) + line_value(row, 10) + line_value(row, 11)
+                + line_value(row, 12) + contracted_travel_cost(row))
+        recap.append({
+            "Line Item": row[0],
+            "Stu Cost": f"${s * sr * sh:,.2f}",
+            "PI Cost": f"${pr2 * ph:,.2f}",
+            "Contracted Total": f"${cont:,.2f}",
         })
-
-    df = pd.DataFrame(table_data)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    # Edit line item
-    bc1, bc2 = st.columns(2)
-    with bc1:
-        if st.button("➕ Add Line Item"):
-            n = len(proj["lines"]) + 1
-            proj["lines"].append(blank_line(f"Phase {n} - New Item"))
-            save()
-            st.rerun()
-    with bc2:
-        del_idx = st.number_input("Line # to delete", min_value=1,
-                                   max_value=max(len(proj["lines"]), 1),
-                                   value=1, key="del_line")
-        if st.button("🗑️ Delete Line Item"):
-            if len(proj["lines"]) > 1:
-                proj["lines"].pop(del_idx - 1)
-                save()
-                st.rerun()
-            else:
-                st.error("Must keep at least one line item.")
-
-    st.subheader("Edit Line Item")
-    edit_idx = st.selectbox("Select line to edit",
-                             range(len(proj["lines"])),
-                             format_func=lambda i: proj["lines"][i][0])
-    row = proj["lines"][edit_idx]
-
-    with st.form("edit_line"):
-        fc = st.columns(4)
-        new_name = fc[0].text_input("Name", value=row[0])
-        new_stu = fc[1].number_input("Students", value=int(line_value(row, 1)), min_value=0)
-        new_sr = fc[2].number_input("Stu Rate", value=line_value(row, 2), min_value=0.0, step=1.0, format="%.2f")
-        new_sh = fc[3].number_input("Stu Hours", value=line_value(row, 3), min_value=0.0, step=0.5, format="%.1f")
-        fc2 = st.columns(4)
-        new_pr = fc2[0].number_input("PI Rate", value=line_value(row, 4), min_value=0.0, step=1.0, format="%.2f")
-        new_ph = fc2[1].number_input("PI Hours", value=line_value(row, 5), min_value=0.0, step=0.5, format="%.1f")
-        new_trv = fc2[2].number_input("Actual Travel", value=line_value(row, 8), min_value=0.0, step=1.0, format="%.2f")
-        new_cp = fc2[3].number_input("Cont. Personnel", value=line_value(row, 9), min_value=0.0, step=1.0, format="%.2f")
-        fc3 = st.columns(4)
-        new_cpi = fc3[0].number_input("Cont. PI", value=line_value(row, 10), min_value=0.0, step=1.0, format="%.2f")
-        new_ci = fc3[1].number_input("Cont. Indirect", value=line_value(row, 11), min_value=0.0, step=1.0, format="%.2f")
-        new_cf = fc3[2].number_input("Cont. Fringe", value=line_value(row, 12), min_value=0.0, step=1.0, format="%.2f")
-        new_ct = fc3[3].number_input("Cont. Travel", value=contracted_travel_cost(row), min_value=0.0, step=1.0, format="%.2f")
-
-        if st.form_submit_button("💾 Save Changes"):
-            row[:] = [
-                new_name, new_stu, new_sr, new_sh, new_pr, new_ph,
-                0.0, 0.0, new_trv, new_cp, new_cpi, new_ci, new_cf, new_ct
-            ]
-            save()
-            st.success(f"Updated '{new_name}'!")
-            st.rerun()
+    if recap:
+        st.caption("Computed costs (from last save)")
+        st.dataframe(pd.DataFrame(recap), use_container_width=True, hide_index=True)
 
     # Notes
     st.subheader("Notes")
@@ -364,7 +386,7 @@ elif page == "Project View":
     if st.button("💾 Save Notes"):
         proj["notes"] = notes
         save()
-        st.success("Notes saved!")
+        st.toast("Notes saved")
 
     # Tool assignments
     st.subheader("Assigned Tools")
@@ -388,7 +410,7 @@ elif page == "Project View":
                 mc, ac = calc_tool_costs(t)
                 total_m += mc; total_a += ac
                 tool_data.append({"Tool": tn, "Vendor": t.get("vendor", ""),
-                                   "Monthly": f"${mc:,.2f}", "Annual": f"${ac:,.2f}"})
+                                  "Monthly": f"${mc:,.2f}", "Annual": f"${ac:,.2f}"})
             else:
                 tool_data.append({"Tool": tn, "Vendor": "—", "Monthly": "—", "Annual": "—"})
         st.dataframe(pd.DataFrame(tool_data), use_container_width=True, hide_index=True)
@@ -413,12 +435,7 @@ elif page == "Master View":
 
     rows = []
     gt_b = gt_s = gt_p = 0.0; gt_c = 0
-    for name in sorted(pr.keys()):
-        proj = pr[name]
-        if search and search.lower() not in name.lower() and search.lower() not in proj["code"].lower():
-            continue
-        if not project_in_fy(proj, fy):
-            continue
+    for name, proj in filtered_projects(search, fy):
         is_red = proj.get("has_budget", False)
         budget = stu = pi = 0.0
         for row in proj["lines"]:
@@ -447,8 +464,7 @@ elif page == "Master View":
         st.markdown(f"**Grand Total — Budget: ${gt_b:,.2f} | Personnel: ${gt_s:,.2f} | "
                     f"PI: ${gt_p:,.2f} | Credits: {gt_c}**")
 
-    # CSV download
-    if rows:
+        # CSV download
         csv = pd.DataFrame(rows).to_csv(index=False)
         st.download_button("⬇️ Download CSV", csv, "master_summary.csv", "text/csv")
 
@@ -465,12 +481,7 @@ elif page == "Actual vs Budget":
     fy = fc2.selectbox("Fiscal Year", get_fy_options(D()), key="avb_fy")
 
     rows = []
-    for name in sorted(pr.keys()):
-        proj = pr[name]
-        if search and search.lower() not in name.lower() and search.lower() not in proj["code"].lower():
-            continue
-        if not project_in_fy(proj, fy):
-            continue
+    for name, proj in filtered_projects(search, fy):
         is_red = proj.get("has_budget", False)
 
         # Budget / contracted categories
@@ -592,14 +603,21 @@ elif page == "Credits":
     if credits:
         df = pd.DataFrame(credits)
         df.columns = ["Name", "Student ID", "Credits", "Project"]
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        del_id = st.selectbox("Remove student by ID",
-                               [s["student_id"] for s in credits])
-        if st.button("🗑️ Remove"):
-            D()["student_credits"] = [s for s in credits if s["student_id"] != del_id]
-            save()
-            st.rerun()
+        event = st.dataframe(
+            df, use_container_width=True, hide_index=True,
+            on_select="rerun", selection_mode="single-row", key="credits_table",
+        )
+        sel = event.selection.rows
+        if sel:
+            i = sel[0]
+            st.caption(f"Selected: **{credits[i]['name']}** ({credits[i]['student_id']})")
+            if st.button("🗑️ Remove Student"):
+                rem_id = credits[i]["student_id"]
+                D()["student_credits"] = [s for s in credits if s["student_id"] != rem_id]
+                save()
+                st.rerun()
+        else:
+            st.caption("Click a row above to remove a student.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -629,18 +647,18 @@ elif page == "Invoices / WO":
     edit_row = edit_rec = edit_inst = None
     form_type = inv_type
     if action_mode == "Edit Existing" and flat:
-        edit_pick = st.number_input(
-            "Row # to edit (from table below)",
-            min_value=1,
-            max_value=len(flat),
-            value=1,
+        edit_pick = st.selectbox(
+            "Record to edit",
+            range(len(flat)),
+            format_func=lambda i: f"{flat[i]['type']} #{flat[i]['number']} — "
+                                  f"{flat[i]['project']} — ${flat[i]['inst_amount']:,.2f}",
             key="invoice_edit_row_picker",
         )
-        edit_row = flat[edit_pick - 1]
+        edit_row = flat[edit_pick]
         edit_rec = edit_row["_rec"]
         edit_inst = edit_row["_inst"]
         form_type = edit_row["type"]
-        st.caption(f"Editing row {edit_pick}: {form_type} #{edit_row['number']} — {edit_row['project']}")
+        st.caption(f"Editing: {form_type} #{edit_row['number']} — {edit_row['project']}")
 
     with st.form("add_edit_inv"):
         st.subheader(f"{'Edit' if action_mode == 'Edit Existing' else 'Add'} {form_type}")
@@ -658,7 +676,7 @@ elif page == "Invoices / WO":
         else:
             default_desc = ""
 
-        num = ic[0].text_input("Number", value=default_number, key="invwo_number")
+        num_field = ic[0].text_input("Number", value=default_number, key="invwo_number")
         proj = ic[1].selectbox("Project", project_options, index=project_index, key="invwo_project")
         desc_label = "Period / Label" if form_type == "Work Order" else "Description"
         desc = ic[2].text_input(desc_label, value=default_desc, key="invwo_description")
@@ -687,10 +705,10 @@ elif page == "Invoices / WO":
                 "💾 Save Invoice Changes" if action_mode == "Edit Existing" else "💾 Save Invoice"
             )
             if submit_invoice:
-                if not num:
+                if not num_field:
                     st.error("Number is required.")
                 elif action_mode == "Edit Existing" and edit_rec is not None:
-                    edit_rec["number"] = num
+                    edit_rec["number"] = num_field
                     edit_rec["project"] = proj
                     edit_rec["description"] = desc
                     edit_rec["amount"] = round(amt, 2)
@@ -704,7 +722,7 @@ elif page == "Invoices / WO":
                     st.rerun()
                 else:
                     D()["invoices"].append({
-                        "type": "Invoice", "number": num, "project": proj,
+                        "type": "Invoice", "number": num_field, "project": proj,
                         "description": desc, "amount": round(amt, 2),
                         "net_terms": net, "due_date": str(due) if due else "",
                         "hours_deducted": hrs_ded if hrs_ded else "",
@@ -734,10 +752,10 @@ elif page == "Invoices / WO":
 
                 save_wo_edit = st.form_submit_button("💾 Save Work Order Changes")
                 if save_wo_edit:
-                    if not num:
+                    if not num_field:
                         st.error("Number is required.")
                     else:
-                        edit_rec["number"] = num
+                        edit_rec["number"] = num_field
                         edit_rec["project"] = proj
                         edit_rec["description"] = edit_rec.get("description", "")
                         edit_inst["period"] = desc
@@ -778,11 +796,11 @@ elif page == "Invoices / WO":
                         st.success("Installment added. Add another installment or save the work order.")
                         st.rerun()
 
-                if save_wo and num:
+                if save_wo and num_field:
                     if st.session_state.wo_installments:
                         D()["invoices"].append({
-                            "type": "Work Order", "number": num, "project": proj,
-                            "description": num,
+                            "type": "Work Order", "number": num_field, "project": proj,
+                            "description": num_field,
                             "installments": list(st.session_state.wo_installments),
                         })
                         wo_t = sum(i["amount"] for i in st.session_state.wo_installments)
@@ -794,7 +812,7 @@ elif page == "Invoices / WO":
                         st.rerun()
                     else:
                         st.error("Add at least one installment.")
-                elif save_wo and not num:
+                elif save_wo and not num_field:
                     st.error("Number is required.")
 
     # Show staged installments
@@ -826,42 +844,48 @@ elif page == "Invoices / WO":
                 "Sent": "☑" if r["sent"] else "☐",
                 "Paid": "☑" if r["paid"] else "☐",
             })
-        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+        event = st.dataframe(
+            pd.DataFrame(display_rows), use_container_width=True, hide_index=True,
+            on_select="rerun", selection_mode="single-row", key="invoice_table",
+        )
 
-        # Toggle sent/paid and Delete
+        # Quick actions on the selected row (click a row above)
         st.subheader("Quick Actions")
-        tg_c = st.columns(4)
-        tg_idx = tg_c[0].number_input("Row # (1-based)", min_value=1,
-                                        max_value=len(flat), value=1)
-        tg_field = tg_c[1].selectbox("Toggle", ["sent", "paid"])
-        if tg_c[2].button("Toggle ☐ ↔ ☑"):
-            r = flat[tg_idx - 1]
-            if r["_inst"] is not None:
-                r["_inst"][tg_field] = not r["_inst"][tg_field]
-            else:
-                r["_rec"][tg_field] = not r["_rec"][tg_field]
-            save()
-            st.rerun()
-        if tg_c[3].button("🗑️ Delete Row"):
-            r = flat[tg_idx - 1]
-            rec = r["_rec"]
-            if r["_inst"] is not None:
-                # WO installment — remove just this installment
-                rec.get("installments", []).remove(r["_inst"])
-                # If no installments left, remove the whole WO
-                if not rec.get("installments"):
+        sel = event.selection.rows
+        if sel:
+            r = flat[sel[0]]
+            st.caption(f"Selected: {r['type']} #{r['number']} — {r['project']} — ${r['inst_amount']:,.2f}")
+            qc1, qc2, qc3 = st.columns([1, 1, 1])
+            tg_field = qc1.selectbox("Toggle field", ["sent", "paid"], key="inv_toggle_field")
+            if qc2.button("Toggle ☐ ↔ ☑"):
+                if r["_inst"] is not None:
+                    r["_inst"][tg_field] = not r["_inst"][tg_field]
+                else:
+                    r["_rec"][tg_field] = not r["_rec"][tg_field]
+                save()
+                st.rerun()
+            if qc3.button("🗑️ Delete Selected"):
+                rec = r["_rec"]
+                if r["_inst"] is not None:
+                    # WO installment — remove just this installment
+                    rec.get("installments", []).remove(r["_inst"])
+                    # If no installments left, remove the whole WO
+                    if not rec.get("installments"):
+                        D()["invoices"].remove(rec)
+                else:
+                    # Invoice — remove the whole record
                     D()["invoices"].remove(rec)
-            else:
-                # Invoice — remove the whole record
-                D()["invoices"].remove(rec)
-            save()
-            st.rerun()
+                save()
+                st.rerun()
+        else:
+            st.caption("Click a row above to toggle Sent/Paid or delete it.")
 
         # CSV export
         csv = pd.DataFrame(display_rows).to_csv(index=False)
         st.download_button("⬇️ Export CSV", csv, "invoices_wo.csv", "text/csv")
 
 
+# ═════════════════════════════════════════════════════════════════════════
 # HOURS
 # ═════════════════════════════════════════════════════════════════════════
 elif page == "Hours":
@@ -881,7 +905,7 @@ elif page == "Hours":
 
     with hc2:
         new_budget = st.number_input("Annual Hours Budget", value=budget,
-                                      min_value=0.0, step=1.0, format="%.1f")
+                                     min_value=0.0, step=1.0, format="%.1f")
         if st.button("Set Budget"):
             proj["hours_budget"] = new_budget
             save()
@@ -922,14 +946,18 @@ elif page == "Hours":
                     "Description": e.get("description", ""),
                     "Remaining": f"{running:.1f}",
                 })
-            st.dataframe(pd.DataFrame(log_data), use_container_width=True, hide_index=True)
-
-            del_idx = st.number_input("Entry # to delete (1-based)",
-                                       min_value=1, max_value=len(log), value=1)
-            if st.button("🗑️ Delete Entry"):
-                log.pop(del_idx - 1)
-                save()
-                st.rerun()
+            event = st.dataframe(
+                pd.DataFrame(log_data), use_container_width=True, hide_index=True,
+                on_select="rerun", selection_mode="single-row", key="hours_log_table",
+            )
+            sel = event.selection.rows
+            if sel:
+                if st.button("🗑️ Delete Selected Entry"):
+                    log.pop(sel[0])
+                    save()
+                    st.rerun()
+            else:
+                st.caption("Click an entry above to delete it.")
         else:
             st.info("No deductions yet.")
 
@@ -980,13 +1008,13 @@ elif page == "Tools":
         t_name = tc[0].text_input("Tool Name", value=selected_tool.get("name", ""))
         t_vendor = tc[1].text_input("Vendor", value=selected_tool.get("vendor", ""))
         t_cost = tc[2].number_input("Cost ($)",
-                                     value=float(selected_tool.get("cost", 0.0)),
-                                     min_value=0.0, step=1.0, format="%.2f")
+                                    value=float(selected_tool.get("cost", 0.0)),
+                                    min_value=0.0, step=1.0, format="%.2f")
         tc2 = st.columns(4)
         t_cycle = tc2[0].selectbox("Billing Cycle", cycle_options, index=cycle_index)
         t_start = tc2[1].date_input("Start Date",
-                                     value=parse_date(selected_tool.get("start_date", "")),
-                                     key=f"tool_start_{tool_mode}_{edit_tool_idx}")
+                                    value=parse_date(selected_tool.get("start_date", "")),
+                                    key=f"tool_start_{tool_mode}_{edit_tool_idx}")
         t_renew = tc2[2].checkbox("Auto-renew", value=selected_tool.get("auto_renew", True))
         t_paid = tc2[3].checkbox("Paid", value=selected_tool.get("paid", False))
         t_notes = st.text_input("Notes", value=selected_tool.get("notes", ""))
@@ -1041,17 +1069,24 @@ elif page == "Tools":
                 "Paid": "☑" if t.get("paid") else "☐",
                 "Notes": t.get("notes", ""),
             })
-        st.dataframe(pd.DataFrame(tool_data), use_container_width=True, hide_index=True)
+        event = st.dataframe(
+            pd.DataFrame(tool_data), use_container_width=True, hide_index=True,
+            on_select="rerun", selection_mode="single-row", key="tools_table",
+        )
 
-        # Toggle paid / Delete
-        tc1, tc2, tc3 = st.columns(3)
-        t_idx = tc1.number_input("Tool # (1-based)", min_value=1,
-                                  max_value=len(tools), value=1)
-        if tc2.button("Toggle Paid ☐ ↔ ☑"):
-            tools[t_idx - 1]["paid"] = not tools[t_idx - 1].get("paid", False)
-            save()
-            st.rerun()
-        if tc3.button("🗑️ Delete Tool"):
-            tools.pop(t_idx - 1)
-            save()
-            st.rerun()
+        # Toggle paid / Delete on the selected row
+        sel = event.selection.rows
+        if sel:
+            i = sel[0]
+            st.caption(f"Selected: **{tools[i].get('name', '')}**")
+            b1, b2 = st.columns(2)
+            if b1.button("Toggle Paid ☐ ↔ ☑"):
+                tools[i]["paid"] = not tools[i].get("paid", False)
+                save()
+                st.rerun()
+            if b2.button("🗑️ Delete Tool"):
+                tools.pop(i)
+                save()
+                st.rerun()
+        else:
+            st.caption("Click a row above to toggle Paid or delete a tool.")
