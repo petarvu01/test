@@ -1,6 +1,7 @@
 """PM Dashboard — Streamlit Web App."""
 import streamlit as st
 import pandas as pd
+import numpy as np
 from datetime import date
 from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
                      calc_payment_due, calc_renewal_date, calc_tool_costs)
@@ -67,6 +68,60 @@ def filtered_projects(search, fy):
         yield name, proj
 
 
+def fy_choices():
+    """Concrete FY labels (no 'All') from project dates + any saved student-worker
+    tables + the current fiscal year, so a year is always available to pick."""
+    years = set()
+    for proj in D()["project_records"].values():
+        ext = proj.get("extension_date", "")
+        eff_end = ext if ext else proj.get("end_date", "")
+        for ds in (proj.get("start_date", ""), eff_end):
+            d = parse_date(ds)
+            if d:
+                years.add(date_to_fy(d))
+    for label in D().get("student_workers", {}):
+        try:
+            years.add(int(label.split()[1].split("-")[0]))
+        except Exception:
+            pass
+    years.add(date_to_fy(date.today()))
+    return [fy_label(y) for y in sorted(years)]
+
+
+def read_excel(file):
+    """Read an uploaded Excel file into a DataFrame, with date columns as strings."""
+    df = pd.read_excel(file)
+    for c in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            df[c] = df[c].dt.strftime("%Y-%m-%d")
+    return df
+
+
+def df_to_store(df):
+    """Convert a DataFrame to a JSON-safe {columns, data} dict for saving."""
+    clean = df.astype(object).where(pd.notna(df), None)
+    data = []
+    for _, row in clean.iterrows():
+        out = []
+        for v in row:
+            if isinstance(v, np.integer):
+                out.append(int(v))
+            elif isinstance(v, np.floating):
+                out.append(float(v))
+            elif v is None or isinstance(v, (str, int, float, bool)):
+                out.append(v)
+            else:
+                out.append(str(v))
+        data.append(out)
+    return {"columns": [str(c) for c in df.columns], "data": data}
+
+
+def store_to_df(store):
+    if not store:
+        return pd.DataFrame()
+    return pd.DataFrame(store.get("data", []), columns=store.get("columns", []))
+
+
 # ─── Custom CSS ──────────────────────────────────────────────────────────
 st.markdown("""<style>
     /* ── Sidebar ────────────────────────────────────────────────────── */
@@ -124,9 +179,11 @@ NAV_ITEMS = [
     ("📋", "Master View"),
     ("📈", "Actual vs Budget"),
     ("🎓", "Credits"),
+    ("👥", "Student Workers"),
     ("📄", "Invoices / WO"),
     ("⏱️", "Hours"),
     ("🛠️", "Tools"),
+    ("🆚", "Results"),
 ]
 
 if "page" not in st.session_state:
@@ -621,6 +678,62 @@ elif page == "Credits":
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# STUDENT WORKERS
+# ═════════════════════════════════════════════════════════════════════════
+elif page == "Student Workers":
+    st.title("👥 Student Workers")
+    D().setdefault("student_workers", {})
+    sw = D()["student_workers"]
+
+    fy = st.selectbox("Fiscal Year for this table", fy_choices(), key="sw_fy")
+
+    st.subheader("Load from Excel")
+    up = st.file_uploader(
+        f"Drag an Excel file here to load the {fy} student worker list",
+        type=["xlsx", "xls"], key="sw_upload",
+    )
+    if up is not None:
+        try:
+            df_new = read_excel(up)
+            st.caption(f"Preview — {len(df_new)} rows, {len(df_new.columns)} columns")
+            st.dataframe(df_new, use_container_width=True, hide_index=True)
+            if st.button(f"💾 Save to {fy}", type="primary"):
+                sw[fy] = df_to_store(df_new)
+                save()
+                st.toast(f"Saved {len(df_new)} student workers to {fy}")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Couldn't read that file: {e}. Try re-saving it as .xlsx.")
+
+    st.subheader(f"Saved table — {fy}")
+    if sw.get(fy) and sw[fy].get("data"):
+        cur = store_to_df(sw[fy])
+        st.caption("Edit cells directly, or use the grid's ＋ / row checkboxes to add and "
+                   "remove rows, then Save Edits.")
+        edited = st.data_editor(
+            cur, use_container_width=True, hide_index=True,
+            num_rows="dynamic", key=f"sw_editor_{fy}",
+        )
+        b1, b2, b3 = st.columns([1, 1, 2])
+        if b1.button("💾 Save Edits"):
+            sw[fy] = df_to_store(edited)
+            save()
+            st.toast("Saved")
+            st.rerun()
+        if b2.button("🗑️ Clear Table"):
+            sw.pop(fy, None)
+            save()
+            st.rerun()
+        st.markdown(f"**{len(cur)} student workers in {fy}**")
+        csv = cur.to_csv(index=False)
+        st.download_button("⬇️ Export CSV", csv,
+                           f"student_workers_{fy.replace(' ', '_')}.csv", "text/csv")
+    else:
+        st.info(f"No student worker table saved for {fy} yet. "
+                "Drag an Excel file above to add one.")
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # INVOICES / WO
 # ═════════════════════════════════════════════════════════════════════════
 elif page == "Invoices / WO":
@@ -1090,3 +1203,84 @@ elif page == "Tools":
                 st.rerun()
         else:
             st.caption("Click a row above to toggle Paid or delete a tool.")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# RESULTS — FY COMPARISON
+# ═════════════════════════════════════════════════════════════════════════
+elif page == "Results":
+    st.title("🆚 Results — Fiscal Year Comparison")
+    choices = fy_choices()
+
+    c1, c2 = st.columns(2)
+    fy_a = c1.selectbox("Compare from (older FY)", choices, index=0, key="res_fy_a")
+    fy_b = c2.selectbox("…to (newer FY)", choices,
+                        index=len(choices) - 1, key="res_fy_b")
+
+    def metrics_for(fy):
+        proj_count = 0
+        budget = 0.0
+        credits = 0
+        for name, proj in filtered_projects("", fy):
+            proj_count += 1
+            # has_budget == True means a "No Budget" project, so it's excluded from budget totals
+            if not proj.get("has_budget", False):
+                for row in proj["lines"]:
+                    budget += (line_value(row, 9) + line_value(row, 10)
+                               + line_value(row, 11) + line_value(row, 12)
+                               + contracted_travel_cost(row))
+            credits += sum(s["credits"] for s in D()["student_credits"]
+                           if s["project"] == name)
+        sw_rec = D().get("student_workers", {}).get(fy)
+        sw_count = len(sw_rec.get("data", [])) if sw_rec else 0
+        return {"Student Workers": sw_count, "Projects": proj_count,
+                "Budget": budget, "Credits": credits}
+
+    ma = metrics_for(fy_a)
+    mb = metrics_for(fy_b)
+    metric_order = ["Student Workers", "Projects", "Budget", "Credits"]
+
+    def growth(a, b):
+        return None if a == 0 else (b - a) / a * 100
+
+    def fmt_val(metric, v):
+        return f"${v:,.2f}" if metric == "Budget" else f"{int(v):,}"
+
+    st.caption(f"Comparing **{fy_a} → {fy_b}** "
+               f"({'same year' if fy_a == fy_b else 'year over year'})")
+
+    # Headline cards (newer FY value, with growth % as the delta arrow)
+    cols = st.columns(4)
+    for col, metric in zip(cols, metric_order):
+        a, b = ma[metric], mb[metric]
+        g = growth(a, b)
+        col.metric(metric, fmt_val(metric, b),
+                   None if g is None else f"{g:+.1f}%")
+
+    # Detailed table: both years, absolute change, and growth %
+    rows = []
+    for metric in metric_order:
+        a, b = ma[metric], mb[metric]
+        g = growth(a, b)
+        change = b - a
+        if metric == "Budget":
+            sign = "+" if change >= 0 else "−"
+            change_str = f"{sign}${abs(change):,.2f}"
+        else:
+            change_str = f"{int(change):+,}"
+        rows.append({
+            "Metric": metric,
+            fy_a: fmt_val(metric, a),
+            fy_b: fmt_val(metric, b),
+            "Change": change_str,
+            "Growth %": "—" if g is None else f"{g:+.1f}%",
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption("Growth % shows “—” when the older year is 0 (no baseline to divide by). "
+               "Budget and project count are based on projects active in each FY; "
+               "credits come from the Credits tab; student workers from the saved table for that FY.")
+
+    csv = pd.DataFrame(rows).to_csv(index=False)
+    st.download_button("⬇️ Download CSV", csv,
+                       f"results_{fy_a.replace(' ', '_')}_vs_{fy_b.replace(' ', '_')}.csv",
+                       "text/csv")
