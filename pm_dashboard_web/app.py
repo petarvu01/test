@@ -753,27 +753,36 @@ elif page == "Invoices / WO":
                 st.markdown("**Add installments below, then click Save Work Order.**")
                 if "wo_installments" not in st.session_state:
                     st.session_state.wo_installments = []
-                ic2 = st.columns(4)
-                period = ic2[0].text_input("Period / Label", key="wo_new_period")
-                inst_amt = ic2[1].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="wo_new_amount")
-                inst_net = ic2[2].selectbox("Net Terms", ["Net 30", "Net 60", "Net 90", "Net 120"], key="wo_new_net_terms")
-                inst_due = ic2[3].date_input("Invoice Date", value=None, key="wo_new_invoice_date")
+
+                # Use the main Work Order "Period / Label" box above as the installment label.
+                # This avoids duplicate Period widgets and makes Add Installment behave reliably.
+                ic2 = st.columns(3)
+                inst_amt = ic2[0].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="wo_new_amount")
+                inst_net = ic2[1].selectbox("Net Terms", ["Net 30", "Net 60", "Net 90", "Net 120"], key="wo_new_net_terms")
+                inst_due = ic2[2].date_input("Invoice Date", value=None, key="wo_new_invoice_date")
                 add_inst = st.form_submit_button("➕ Add Installment")
                 save_wo = st.form_submit_button("💾 Save Work Order")
 
-                if add_inst and period:
-                    st.session_state.wo_installments.append({
-                        "period": period, "amount": round(inst_amt, 2),
-                        "net_terms": inst_net,
-                        "due_date": str(inst_due) if inst_due else "",
-                        "sent": False, "paid": False,
-                    })
-                    st.rerun()
+                if add_inst:
+                    if not desc:
+                        st.error("Period / Label is required before adding an installment.")
+                    elif inst_amt <= 0:
+                        st.error("Installment amount must be greater than $0.")
+                    else:
+                        st.session_state.wo_installments.append({
+                            "period": desc, "amount": round(inst_amt, 2),
+                            "net_terms": inst_net,
+                            "due_date": str(inst_due) if inst_due else "",
+                            "sent": False, "paid": False,
+                        })
+                        st.success("Installment added. Add another installment or save the work order.")
+                        st.rerun()
+
                 if save_wo and num:
                     if st.session_state.wo_installments:
                         D()["invoices"].append({
                             "type": "Work Order", "number": num, "project": proj,
-                            "description": desc,
+                            "description": num,
                             "installments": list(st.session_state.wo_installments),
                         })
                         wo_t = sum(i["amount"] for i in st.session_state.wo_installments)
