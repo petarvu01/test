@@ -45,8 +45,9 @@ def blank_line(name="Phase 1 - Setup"):
     # 0 name, 1 students, 2 stu rate, 3 stu hours, 4 PI rate, 5 PI hours,
     # 6 legacy actual indirect, 7 legacy actual fringe, 8 actual travel,
     # 9 contracted personnel, 10 contracted PI, 11 contracted indirect,
-    # 12 contracted fringe, 13 contracted travel, 14 hours deducted
-    return [name, 0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # 12 contracted fringe, 13 contracted travel
+    # Hours deducted is COMPUTED from (students × stu hours) + PI hours — no field.
+    return [name, 0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 def blank_project(code, name, has_budget=False):
@@ -69,12 +70,12 @@ def validate_line(line):
             line.append(float(line[8]))
         except Exception:
             line.append(0.0)
-    while len(line) < 15:
+    while len(line) < 14:
         line.append(0.0)
     # Legacy actual indirect/fringe are no longer used.
     line[6] = 0.0
     line[7] = 0.0
-    return line[:15]
+    return line[:14]
 
 
 def default_data():
@@ -176,13 +177,19 @@ def project_contracted_total(proj: dict) -> float:
 
 def project_hours_summary(proj: dict):
     """Return (budget, deducted) hours for a project.
+
     Budget   = project-level contracted_hours (annual).
-    Deducted = sum of per-line hours_deducted (line field 14)."""
+    Deducted = sum over lines of (Students × Stu Hours) + PI Hours.
+               Many students can each log hours; PI is a single person.
+    """
     budget = float(proj.get("contracted_hours", 0.0))
     deducted = 0.0
     for r in proj.get("lines", []):
         try:
-            deducted += float(r[14]) if len(r) > 14 else 0.0
+            students = int(r[1]) if len(r) > 1 else 0
+            stu_hrs  = float(r[3]) if len(r) > 3 else 0.0
+            pi_hrs   = float(r[5]) if len(r) > 5 else 0.0
+            deducted += students * stu_hrs + pi_hrs
         except (TypeError, ValueError):
             pass
     return budget, deducted

@@ -394,8 +394,8 @@ elif page == "Project View":
     st.subheader("Line Items")
     st.caption("Edit any cell directly. Use the **＋** at the bottom of the grid to add a "
                "line, or tick a row's checkbox and press your keyboard Delete to remove it — "
-               "then click Save Line Items. Type a number into **Hours Deducted** to record "
-               "hours used against the project's Contracted Hours budget.")
+               "then click Save Line Items. Hours deducted from the Contracted Hours budget "
+               "are computed automatically: **(Students × Stu Hours) + PI Hours** per line.")
 
     edit_df = pd.DataFrame([{
         "Line Item": row[0],
@@ -410,7 +410,6 @@ elif page == "Project View":
         "Cont. Indirect": line_value(row, 11),
         "Cont. Fringe": line_value(row, 12),
         "Cont. Travel": contracted_travel_cost(row),
-        "Hours Deducted": line_value(row, 14),
     } for row in proj["lines"]])
 
     money = st.column_config.NumberColumn(min_value=0.0, step=1.0, format="$%.2f")
@@ -425,7 +424,6 @@ elif page == "Project View":
             "PI Rate": money, "PI Hours": hours,
             "Actual Travel": money, "Cont. Personnel": money, "Cont. PI": money,
             "Cont. Indirect": money, "Cont. Fringe": money, "Cont. Travel": money,
-            "Hours Deducted": hours,
         },
     )
 
@@ -437,7 +435,6 @@ elif page == "Project View":
             0.0, 0.0, num(r["Actual Travel"]),
             num(r["Cont. Personnel"]), num(r["Cont. PI"]),
             num(r["Cont. Indirect"]), num(r["Cont. Fringe"]), num(r["Cont. Travel"]),
-            num(r["Hours Deducted"]),
         ] for _, r in edited.iterrows()]
         proj["lines"] = new_lines or [blank_line()]
         save()
@@ -451,15 +448,20 @@ elif page == "Project View":
         pr2, ph = line_value(row, 4), line_value(row, 5)
         cont = (line_value(row, 9) + line_value(row, 10) + line_value(row, 11)
                 + line_value(row, 12) + contracted_travel_cost(row))
+        student_hrs_total = s * sh
+        line_deducted = student_hrs_total + ph
         recap.append({
             "Line Item": row[0],
             "Stu Cost": f"${s * sr * sh:,.2f}",
             "PI Cost": f"${pr2 * ph:,.2f}",
             "Contracted Total": f"${cont:,.2f}",
-            "Hours Deducted": f"{line_value(row, 14):.1f}",
+            "Stu Hrs (× students)": f"{student_hrs_total:.1f}",
+            "PI Hrs": f"{ph:.1f}",
+            "Hours Deducted": f"{line_deducted:.1f}",
         })
     if recap:
-        st.caption("Computed costs (from last save)")
+        st.caption("Computed values (from last save) — Hours Deducted per line "
+                   "= (Students × Stu Hours) + PI Hours")
         st.dataframe(pd.DataFrame(recap), use_container_width=True, hide_index=True)
 
     # Notes
