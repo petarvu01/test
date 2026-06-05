@@ -45,14 +45,13 @@ def blank_line(name="Phase 1 - Setup"):
     # 0 name, 1 students, 2 stu rate, 3 stu hours, 4 PI rate, 5 PI hours,
     # 6 legacy actual indirect, 7 legacy actual fringe, 8 actual travel,
     # 9 contracted personnel, 10 contracted PI, 11 contracted indirect,
-    # 12 contracted fringe, 13 contracted travel, 14 contracted hours
-    return [name, 0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # 12 contracted fringe, 13 contracted travel
+    return [name, 0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 def blank_project(code, name, has_budget=False):
     return {
         "code": code, "has_budget": has_budget,
-        "mode": "none" if has_budget else "dollar",
         "start_date": "", "end_date": "", "extension_date": "",
         "notes": "", "hours_budget": 0.0, "hours_log": [],
         "assigned_tools": [],
@@ -69,12 +68,12 @@ def validate_line(line):
             line.append(float(line[8]))
         except Exception:
             line.append(0.0)
-    while len(line) < 15:
+    while len(line) < 14:
         line.append(0.0)
     # Legacy actual indirect/fringe are no longer used.
     line[6] = 0.0
     line[7] = 0.0
-    return line[:15]
+    return line[:14]
 
 
 def default_data():
@@ -106,9 +105,6 @@ def load_data() -> dict:
                                   ("extension_date",""), ("hours_budget",0.0),
                                   ("hours_log",[]), ("assigned_tools",[])]:
                 proj.setdefault(key, default)
-            # Mode migration: existing projects default to "dollar", red ones to "none".
-            if "mode" not in proj:
-                proj["mode"] = "none" if proj.get("has_budget", False) else "dollar"
             proj["lines"] = [validate_line(l) for l in proj.get("lines", [])]
             if not proj["lines"]:
                 proj["lines"] = [blank_line()]
@@ -171,25 +167,6 @@ def compute_master_totals(data: dict) -> dict:
 def project_contracted_total(proj: dict) -> float:
     return sum(float(r[9]) + float(r[10]) + float(r[11]) + float(r[12]) + float(r[13])
                for r in proj.get("lines", []))
-
-
-def project_hours_totals(proj: dict):
-    """Return (budget, used) hours for an hours-mode project; (0, 0) for others.
-    Budget = sum of per-line contracted hours (field 14).
-    Used   = sum of per-line (Stu Hours + PI Hours)."""
-    if proj.get("mode") != "hours":
-        return 0.0, 0.0
-    budget = used = 0.0
-    for r in proj.get("lines", []):
-        try:
-            budget += float(r[14]) if len(r) > 14 else 0.0
-        except (TypeError, ValueError):
-            pass
-        try:
-            used += float(r[3]) + float(r[5])
-        except (TypeError, ValueError):
-            pass
-    return budget, used
 
 
 def wo_project_total(data: dict, proj_name: str) -> float:
@@ -266,11 +243,12 @@ def get_all_notifications(data: dict) -> list:
             label = "TODAY" if days == 0 else ("TOMORROW" if days == 1 else f"in {days} days")
             notifs.append(("🟡", "Payment Due", row["project"],
                            f"{row['type']} #{row['number']} — ${row['inst_amount']:,.2f} due {label}"))
-    # 2. Hours (Hours-mode projects, budget from line items)
+    # 2. Hours
     for name, proj in data["project_records"].items():
-        budget, used = project_hours_totals(proj)
+        budget = float(proj.get("hours_budget", 0))
         if budget <= 0:
             continue
+        used = sum(float(e.get("hours", 0)) for e in proj.get("hours_log", []))
         pct = used / budget * 100
         remaining = budget - used
         if remaining < 0:
