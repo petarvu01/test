@@ -371,14 +371,31 @@ elif page == "Project View":
     # ── Contracted Hours (annual budget) ─────────────────────────────
     st.subheader("Contracted Hours")
     ch_budget, ch_deducted = project_hours_summary(proj)
-    ch_remaining = ch_budget - ch_deducted
-    ch_pct = (ch_deducted / ch_budget * 100) if ch_budget > 0 else 0
+    tracks_hours = ch_budget > 0
 
-    ch_c1, ch_c2, ch_c3, ch_c4 = st.columns([2, 1, 1, 1])
-    with ch_c1:
+    if tracks_hours:
+        ch_remaining = ch_budget - ch_deducted
+        ch_pct = ch_deducted / ch_budget * 100
+        ch_c1, ch_c2, ch_c3, ch_c4 = st.columns([2, 1, 1, 1])
+        with ch_c1:
+            new_ch = st.number_input(
+                "Annual Cont. Hours (budget)",
+                value=float(ch_budget), min_value=0.0, step=1.0, format="%.1f",
+                key=f"cont_hours_{active}",
+            )
+            if st.button("💾 Save Cont. Hours", key=f"save_ch_{active}"):
+                proj["contracted_hours"] = float(new_ch)
+                save()
+                st.toast("Contracted Hours saved")
+                st.rerun()
+        ch_c2.metric("Deducted", f"{ch_deducted:.0f} hrs")
+        ch_c3.metric("Remaining", f"{ch_remaining:.0f} hrs")
+        ch_c4.metric("% Used", f"{ch_pct:.1f}%")
+    else:
+        # No contracted hours set — show input only; deduction tracking is disabled.
         new_ch = st.number_input(
             "Annual Cont. Hours (budget)",
-            value=float(ch_budget), min_value=0.0, step=1.0, format="%.1f",
+            value=0.0, min_value=0.0, step=1.0, format="%.1f",
             key=f"cont_hours_{active}",
         )
         if st.button("💾 Save Cont. Hours", key=f"save_ch_{active}"):
@@ -386,16 +403,18 @@ elif page == "Project View":
             save()
             st.toast("Contracted Hours saved")
             st.rerun()
-    ch_c2.metric("Deducted", f"{ch_deducted:.0f} hrs")
-    ch_c3.metric("Remaining", f"{ch_remaining:.0f} hrs")
-    ch_c4.metric("% Used", f"{ch_pct:.1f}%")
+        st.caption("No contracted hours set — hours-deduction tracking is off for this "
+                   "project. Set a value above to turn it on.")
 
     # ── Line items (editable grid) ─────────────────────────────────────
     st.subheader("Line Items")
-    st.caption("Edit any cell directly. Use the **＋** at the bottom of the grid to add a "
-               "line, or tick a row's checkbox and press your keyboard Delete to remove it — "
-               "then click Save Line Items. Hours deducted from the Contracted Hours budget "
-               "are computed automatically: **(Students × Stu Hours) + PI Hours** per line.")
+    grid_caption = ("Edit any cell directly. Use the **＋** at the bottom of the grid to add a "
+                    "line, or tick a row's checkbox and press your keyboard Delete to remove it — "
+                    "then click Save Line Items.")
+    if tracks_hours:
+        grid_caption += (" Hours deducted from the Contracted Hours budget are computed "
+                         "automatically: **(Students × Stu Hours) + PI Hours** per line.")
+    st.caption(grid_caption)
 
     edit_df = pd.DataFrame([{
         "Line Item": row[0],
@@ -448,20 +467,25 @@ elif page == "Project View":
         pr2, ph = line_value(row, 4), line_value(row, 5)
         cont = (line_value(row, 9) + line_value(row, 10) + line_value(row, 11)
                 + line_value(row, 12) + contracted_travel_cost(row))
-        student_hrs_total = s * sh
-        line_deducted = student_hrs_total + ph
-        recap.append({
+        item = {
             "Line Item": row[0],
             "Stu Cost": f"${s * sr * sh:,.2f}",
             "PI Cost": f"${pr2 * ph:,.2f}",
             "Contracted Total": f"${cont:,.2f}",
-            "Stu Hrs (× students)": f"{student_hrs_total:.1f}",
-            "PI Hrs": f"{ph:.1f}",
-            "Hours Deducted": f"{line_deducted:.1f}",
-        })
+        }
+        if tracks_hours:
+            student_hrs_total = s * sh
+            line_deducted = student_hrs_total + ph
+            item["Stu Hrs (× students)"] = f"{student_hrs_total:.1f}"
+            item["PI Hrs"] = f"{ph:.1f}"
+            item["Hours Deducted"] = f"{line_deducted:.1f}"
+        recap.append(item)
     if recap:
-        st.caption("Computed values (from last save) — Hours Deducted per line "
-                   "= (Students × Stu Hours) + PI Hours")
+        if tracks_hours:
+            st.caption("Computed values (from last save) — Hours Deducted per line "
+                       "= (Students × Stu Hours) + PI Hours")
+        else:
+            st.caption("Computed costs (from last save)")
         st.dataframe(pd.DataFrame(recap), use_container_width=True, hide_index=True)
 
     # Notes
