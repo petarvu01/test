@@ -45,8 +45,8 @@ def blank_line(name="Phase 1 - Setup"):
     # 0 name, 1 students, 2 stu rate, 3 stu hours, 4 PI rate, 5 PI hours,
     # 6 legacy actual indirect, 7 legacy actual fringe, 8 actual travel,
     # 9 contracted personnel, 10 contracted PI, 11 contracted indirect,
-    # 12 contracted fringe, 13 contracted travel
-    return [name, 0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # 12 contracted fringe, 13 contracted travel, 14 hours deducted
+    return [name, 0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 def blank_project(code, name, has_budget=False):
@@ -54,6 +54,7 @@ def blank_project(code, name, has_budget=False):
         "code": code, "has_budget": has_budget,
         "start_date": "", "end_date": "", "extension_date": "",
         "notes": "", "hours_budget": 0.0, "hours_log": [],
+        "contracted_hours": 0.0,
         "assigned_tools": [],
         "lines": [blank_line("Phase 1 - Setup"), blank_line("Phase 2 - Core Dev")],
     }
@@ -68,12 +69,12 @@ def validate_line(line):
             line.append(float(line[8]))
         except Exception:
             line.append(0.0)
-    while len(line) < 14:
+    while len(line) < 15:
         line.append(0.0)
     # Legacy actual indirect/fringe are no longer used.
     line[6] = 0.0
     line[7] = 0.0
-    return line[:14]
+    return line[:15]
 
 
 def default_data():
@@ -105,6 +106,10 @@ def load_data() -> dict:
                                   ("extension_date",""), ("hours_budget",0.0),
                                   ("hours_log",[]), ("assigned_tools",[])]:
                 proj.setdefault(key, default)
+            # Migrate old Hours-tab project-level budget into the new contracted_hours
+            # field so existing data carries over the first time the new app opens it.
+            if "contracted_hours" not in proj:
+                proj["contracted_hours"] = float(proj.get("hours_budget", 0.0))
             proj["lines"] = [validate_line(l) for l in proj.get("lines", [])]
             if not proj["lines"]:
                 proj["lines"] = [blank_line()]
@@ -167,6 +172,20 @@ def compute_master_totals(data: dict) -> dict:
 def project_contracted_total(proj: dict) -> float:
     return sum(float(r[9]) + float(r[10]) + float(r[11]) + float(r[12]) + float(r[13])
                for r in proj.get("lines", []))
+
+
+def project_hours_summary(proj: dict):
+    """Return (budget, deducted) hours for a project.
+    Budget   = project-level contracted_hours (annual).
+    Deducted = sum of per-line hours_deducted (line field 14)."""
+    budget = float(proj.get("contracted_hours", 0.0))
+    deducted = 0.0
+    for r in proj.get("lines", []):
+        try:
+            deducted += float(r[14]) if len(r) > 14 else 0.0
+        except (TypeError, ValueError):
+            pass
+    return budget, deducted
 
 
 def wo_project_total(data: dict, proj_name: str) -> float:
@@ -243,12 +262,11 @@ def get_all_notifications(data: dict) -> list:
             label = "TODAY" if days == 0 else ("TOMORROW" if days == 1 else f"in {days} days")
             notifs.append(("🟡", "Payment Due", row["project"],
                            f"{row['type']} #{row['number']} — ${row['inst_amount']:,.2f} due {label}"))
-    # 2. Hours
+    # 2. Hours (budget = project-level contracted_hours; used = sum of line hours_deducted)
     for name, proj in data["project_records"].items():
-        budget = float(proj.get("hours_budget", 0))
+        budget, used = project_hours_summary(proj)
         if budget <= 0:
             continue
-        used = sum(float(e.get("hours", 0)) for e in proj.get("hours_log", []))
         pct = used / budget * 100
         remaining = budget - used
         if remaining < 0:

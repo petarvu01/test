@@ -8,7 +8,7 @@ from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
 from data import (load_data, save_data, blank_project, blank_line,
                   compute_master_totals, project_contracted_total,
                   wo_project_total, flat_invoice_rows, get_all_notifications,
-                  get_fy_options, project_in_fy)
+                  get_fy_options, project_in_fy, project_hours_summary)
 
 st.set_page_config(page_title="PM Dashboard", page_icon="📁", layout="wide")
 
@@ -181,7 +181,6 @@ NAV_ITEMS = [
     ("🎓", "Credits"),
     ("👥", "Student Workers"),
     ("📄", "Invoices / WO"),
-    ("⏱️", "Hours"),
     ("🛠️", "Tools"),
     ("🆚", "Results"),
 ]
@@ -258,10 +257,9 @@ if page == "Overview":
         st.subheader("Hours Utilization")
         items = []
         for name, proj in sorted(D()["project_records"].items()):
-            budget = float(proj.get("hours_budget", 0))
+            budget, used = project_hours_summary(proj)
             if budget <= 0:
                 continue
-            used = sum(float(e.get("hours", 0)) for e in proj.get("hours_log", []))
             pct = used / budget * 100
             items.append({"Project": name, "Used": used, "Budget": budget, "% Used": pct})
         if items:
@@ -272,7 +270,7 @@ if page == "Overview":
                 st.progress(min(pct / 100, 1.0))
                 st.caption(f"{item['Used']:.0f} / {item['Budget']:.0f} hrs ({pct:.0f}%)")
         else:
-            st.info("No projects with hours budgets set.")
+            st.info("No projects with contracted hours set.")
 
     with col_right:
         st.subheader("⚠️ Alerts")
@@ -370,11 +368,34 @@ elif page == "Project View":
         save()
         st.toast("Dates saved")
 
+    # ── Contracted Hours (annual budget) ─────────────────────────────
+    st.subheader("Contracted Hours")
+    ch_budget, ch_deducted = project_hours_summary(proj)
+    ch_remaining = ch_budget - ch_deducted
+    ch_pct = (ch_deducted / ch_budget * 100) if ch_budget > 0 else 0
+
+    ch_c1, ch_c2, ch_c3, ch_c4 = st.columns([2, 1, 1, 1])
+    with ch_c1:
+        new_ch = st.number_input(
+            "Annual Cont. Hours (budget)",
+            value=float(ch_budget), min_value=0.0, step=1.0, format="%.1f",
+            key=f"cont_hours_{active}",
+        )
+        if st.button("💾 Save Cont. Hours", key=f"save_ch_{active}"):
+            proj["contracted_hours"] = float(new_ch)
+            save()
+            st.toast("Contracted Hours saved")
+            st.rerun()
+    ch_c2.metric("Deducted", f"{ch_deducted:.0f} hrs")
+    ch_c3.metric("Remaining", f"{ch_remaining:.0f} hrs")
+    ch_c4.metric("% Used", f"{ch_pct:.1f}%")
+
     # ── Line items (editable grid) ─────────────────────────────────────
     st.subheader("Line Items")
     st.caption("Edit any cell directly. Use the **＋** at the bottom of the grid to add a "
                "line, or tick a row's checkbox and press your keyboard Delete to remove it — "
-               "then click Save Line Items.")
+               "then click Save Line Items. Type a number into **Hours Deducted** to record "
+               "hours used against the project's Contracted Hours budget.")
 
     edit_df = pd.DataFrame([{
         "Line Item": row[0],
@@ -389,6 +410,7 @@ elif page == "Project View":
         "Cont. Indirect": line_value(row, 11),
         "Cont. Fringe": line_value(row, 12),
         "Cont. Travel": contracted_travel_cost(row),
+        "Hours Deducted": line_value(row, 14),
     } for row in proj["lines"]])
 
     money = st.column_config.NumberColumn(min_value=0.0, step=1.0, format="$%.2f")
@@ -403,6 +425,7 @@ elif page == "Project View":
             "PI Rate": money, "PI Hours": hours,
             "Actual Travel": money, "Cont. Personnel": money, "Cont. PI": money,
             "Cont. Indirect": money, "Cont. Fringe": money, "Cont. Travel": money,
+            "Hours Deducted": hours,
         },
     )
 
@@ -414,6 +437,7 @@ elif page == "Project View":
             0.0, 0.0, num(r["Actual Travel"]),
             num(r["Cont. Personnel"]), num(r["Cont. PI"]),
             num(r["Cont. Indirect"]), num(r["Cont. Fringe"]), num(r["Cont. Travel"]),
+            num(r["Hours Deducted"]),
         ] for _, r in edited.iterrows()]
         proj["lines"] = new_lines or [blank_line()]
         save()
@@ -432,6 +456,7 @@ elif page == "Project View":
             "Stu Cost": f"${s * sr * sh:,.2f}",
             "PI Cost": f"${pr2 * ph:,.2f}",
             "Contracted Total": f"${cont:,.2f}",
+            "Hours Deducted": f"{line_value(row, 14):.1f}",
         })
     if recap:
         st.caption("Computed costs (from last save)")
@@ -492,6 +517,7 @@ elif page == "Master View":
 
     rows = []
     gt_b = gt_s = gt_p = 0.0; gt_c = 0
+    gt_ch = 0.0
     for name, proj in filtered_projects(search, fy):
         is_red = proj.get("has_budget", False)
         budget = stu = pi = 0.0
@@ -500,6 +526,7 @@ elif page == "Master View":
             budget += line_value(row, 9) + line_value(row, 10) + line_value(row, 11) + line_value(row, 12) + contracted_travel_cost(row)
             stu += actual_personnel_cost(row)
             pi += actual_pi_cost(row)
+        ch_budget, _ = project_hours_summary(proj)
         credits = sum(s["credits"] for s in D()["student_credits"] if s["project"] == name)
         ext = proj.get("extension_date", "")
         ed = proj.get("end_date", "")
@@ -509,17 +536,22 @@ elif page == "Master View":
             "Start": fmt_date(proj.get("start_date", "")),
             "End": end_disp,
             "Budget": f"${budget:,.2f}" if not is_red else "—",
+            "Cont. Hours": f"{ch_budget:.0f}" if ch_budget > 0 else "—",
             "Personnel": f"${stu:,.2f}", "PI Cost": f"${pi:,.2f}",
             "Credits": credits,
         })
         if not is_red:
             gt_b += budget
+        gt_ch += ch_budget
         gt_s += stu; gt_p += pi; gt_c += credits
 
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.markdown(f"**Grand Total — Budget: ${gt_b:,.2f} | Personnel: ${gt_s:,.2f} | "
-                    f"PI: ${gt_p:,.2f} | Credits: {gt_c}**")
+        gt_line = (f"**Grand Total — Budget: ${gt_b:,.2f} | "
+                   f"Personnel: ${gt_s:,.2f} | PI: ${gt_p:,.2f} | Credits: {gt_c}**")
+        if gt_ch > 0:
+            gt_line += f"  \n**Cont. Hours total: {gt_ch:.0f} hrs**"
+        st.markdown(gt_line)
 
         # CSV download
         csv = pd.DataFrame(rows).to_csv(index=False)
@@ -579,11 +611,13 @@ elif page == "Actual vs Budget":
             pct_s = f"{pct:.1f}%"
         ext = proj.get("extension_date", "")
         ed = proj.get("end_date", "")
+        ch_budget, _ = project_hours_summary(proj)
         rows.append({
             "Code": proj["code"], "Project": name,
             "Start": fmt_date(proj.get("start_date", "")),
             "End": fmt_date(ext if ext else ed) + (" ★" if ext else ""),
             "Budget": bstr,
+            "Cont. Hours": f"{ch_budget:.0f}" if ch_budget > 0 else "—",
             "Actuals": f"${actuals:,.2f}",
             "Variance": var_s, "% Used": pct_s,
             "_budget_personnel": cont_personnel,
@@ -598,7 +632,8 @@ elif page == "Actual vs Budget":
         })
 
     if rows:
-        display_cols = ["Code", "Project", "Start", "End", "Budget", "Actuals", "Variance", "% Used"]
+        display_cols = ["Code", "Project", "Start", "End", "Budget", "Cont. Hours",
+                        "Actuals", "Variance", "% Used"]
         display_df = pd.DataFrame([{k: r[k] for k in display_cols} for r in rows])
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
@@ -996,83 +1031,6 @@ elif page == "Invoices / WO":
         # CSV export
         csv = pd.DataFrame(display_rows).to_csv(index=False)
         st.download_button("⬇️ Export CSV", csv, "invoices_wo.csv", "text/csv")
-
-
-# ═════════════════════════════════════════════════════════════════════════
-# HOURS
-# ═════════════════════════════════════════════════════════════════════════
-elif page == "Hours":
-    st.title("⏱️ Hours Tracker")
-    pr = D()["project_records"]
-    projects = projects_sorted()
-
-    hc1, hc2 = st.columns([2, 1])
-    active = hc1.selectbox("Project", projects, key="hrs_proj")
-    proj = pr[active]
-
-    budget = float(proj.get("hours_budget", 0))
-    log = proj.get("hours_log", [])
-    used = sum(float(e.get("hours", 0)) for e in log)
-    remaining = budget - used
-    pct = (used / budget * 100) if budget > 0 else 0
-
-    with hc2:
-        new_budget = st.number_input("Annual Hours Budget", value=budget,
-                                     min_value=0.0, step=1.0, format="%.1f")
-        if st.button("Set Budget"):
-            proj["hours_budget"] = new_budget
-            save()
-            st.rerun()
-
-    mc1, mc2, mc3, mc4 = st.columns(4)
-    mc1.metric("Budget", f"{budget:.0f} hrs")
-    mc2.metric("Used", f"{used:.0f} hrs")
-    mc3.metric("Remaining", f"{remaining:.0f} hrs")
-    mc4.metric("% Consumed", f"{pct:.1f}%")
-
-    col_l, col_r = st.columns([1, 2])
-
-    with col_l:
-        with st.form("deduct_hrs"):
-            st.subheader("Deduct Hours")
-            hrs = st.number_input("Hours", min_value=0.1, value=1.0, step=0.5, format="%.1f")
-            desc = st.text_input("Description")
-            dt = st.date_input("Date", value=date.today())
-            if st.form_submit_button("Deduct"):
-                proj.setdefault("hours_log", []).append({
-                    "date": str(dt), "hours": round(hrs, 2), "description": desc,
-                })
-                save()
-                st.rerun()
-
-    with col_r:
-        st.subheader("Deduction Log")
-        if log:
-            running = budget
-            log_data = []
-            for e in log:
-                h = float(e.get("hours", 0))
-                running -= h
-                log_data.append({
-                    "Date": fmt_date(e.get("date", "")),
-                    "Hours": f"{h:.1f}",
-                    "Description": e.get("description", ""),
-                    "Remaining": f"{running:.1f}",
-                })
-            event = st.dataframe(
-                pd.DataFrame(log_data), use_container_width=True, hide_index=True,
-                on_select="rerun", selection_mode="single-row", key="hours_log_table",
-            )
-            sel = event.selection.rows
-            if sel:
-                if st.button("🗑️ Delete Selected Entry"):
-                    log.pop(sel[0])
-                    save()
-                    st.rerun()
-            else:
-                st.caption("Click an entry above to delete it.")
-        else:
-            st.info("No deductions yet.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
