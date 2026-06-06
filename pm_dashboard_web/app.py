@@ -8,7 +8,8 @@ from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
 from data import (load_data, save_data, blank_project, blank_line,
                   compute_master_totals, project_contracted_total,
                   wo_project_total, flat_invoice_rows, get_all_notifications,
-                  get_fy_options, project_in_fy, project_hours_summary)
+                  get_fy_options, project_in_fy, project_hours_summary,
+                  count_tool_users, tool_share_costs)
 
 st.set_page_config(page_title="PM Dashboard", page_icon="📁", layout="wide")
 
@@ -511,18 +512,29 @@ elif page == "Project View":
             st.rerun()
     if assigned:
         tool_data = []
-        total_m = total_a = 0.0
+        total_m_share = total_a_share = 0.0
         for tn in assigned:
             t = next((t for t in D()["tools"] if t.get("name") == tn), None)
             if t:
-                mc, ac = calc_tool_costs(t)
-                total_m += mc; total_a += ac
-                tool_data.append({"Tool": tn, "Vendor": t.get("vendor", ""),
-                                  "Monthly": f"${mc:,.2f}", "Annual": f"${ac:,.2f}"})
+                full_mc, full_ac = calc_tool_costs(t)
+                share_mc, share_ac = tool_share_costs(D(), t)
+                n_users = count_tool_users(D(), tn)
+                total_m_share += share_mc; total_a_share += share_ac
+                tool_data.append({
+                    "Tool": tn, "Vendor": t.get("vendor", ""),
+                    "Full Annual": f"${full_ac:,.2f}",
+                    "Split among": f"{n_users} project{'s' if n_users != 1 else ''}",
+                    "Your share / mo": f"${share_mc:,.2f}",
+                    "Your share / yr": f"${share_ac:,.2f}",
+                })
             else:
-                tool_data.append({"Tool": tn, "Vendor": "—", "Monthly": "—", "Annual": "—"})
+                tool_data.append({"Tool": tn, "Vendor": "—",
+                                  "Full Annual": "—", "Split among": "—",
+                                  "Your share / mo": "—", "Your share / yr": "—"})
         st.dataframe(pd.DataFrame(tool_data), use_container_width=True, hide_index=True)
-        st.markdown(f"**Total: ${total_m:,.2f}/mo · ${total_a:,.2f}/yr**")
+        st.markdown(f"**This project's share: ${total_m_share:,.2f}/mo · "
+                    f"${total_a_share:,.2f}/yr**")
+        st.caption("Tool costs are split equally among the projects using each tool.")
         rem_tool = st.selectbox("Remove tool", assigned, key="rem_tool")
         if st.button("Remove Tool"):
             assigned.remove(rem_tool)
@@ -622,8 +634,8 @@ elif page == "Actual vs Budget":
         for tn in proj.get("assigned_tools", []):
             t = next((x for x in D()["tools"] if x.get("name") == tn), None)
             if t:
-                _, annual_cost = calc_tool_costs(t)
-                tools_actual += annual_cost
+                _, annual_share = tool_share_costs(D(), t)
+                tools_actual += annual_share
 
         budget = cont_personnel + cont_pi + cont_indirect + cont_fringe + cont_travel
         actuals = pers + pi + trv + tools_actual
@@ -1153,6 +1165,8 @@ elif page == "Tools":
         for t in tools:
             mc, ac = calc_tool_costs(t)
             renewal = calc_renewal_date(t)
+            n_users = count_tool_users(D(), t.get("name", ""))
+            per_proj = f"${ac / n_users:,.2f}" if n_users > 0 else "—"
             tool_data.append({
                 "Tool": t.get("name", ""),
                 "Vendor": t.get("vendor", ""),
@@ -1160,6 +1174,8 @@ elif page == "Tools":
                 "Cycle": t.get("billing_cycle", ""),
                 "Monthly": f"${mc:,.2f}",
                 "Annual": f"${ac:,.2f}",
+                "Used by": f"{n_users}" if n_users else "—",
+                "Per project / yr": per_proj,
                 "Start": fmt_date(t.get("start_date", "")),
                 "Next Renewal": fmt_date(renewal) if renewal else "—",
                 "Auto": "Yes" if t.get("auto_renew") else "No",

@@ -195,6 +195,25 @@ def project_hours_summary(proj: dict):
     return budget, deducted
 
 
+def count_tool_users(data: dict, tool_name: str) -> int:
+    """Number of projects that have this tool in their assigned_tools list."""
+    if not tool_name:
+        return 0
+    return sum(1 for proj in data.get("project_records", {}).values()
+               if tool_name in proj.get("assigned_tools", []))
+
+
+def tool_share_costs(data: dict, tool: dict):
+    """Return (monthly_share, annual_share) — this tool's cost divided equally
+    among the projects it's assigned to. (0, 0) if no projects use it."""
+    from helpers import calc_tool_costs  # local import to avoid cycle
+    n = count_tool_users(data, tool.get("name", ""))
+    if n <= 0:
+        return 0.0, 0.0
+    monthly, annual = calc_tool_costs(tool)
+    return monthly / n, annual / n
+
+
 def wo_project_total(data: dict, proj_name: str) -> float:
     total = 0.0
     for rec in data["invoices"]:
