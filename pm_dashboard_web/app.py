@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import json
 from datetime import date
 from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
                      calc_payment_due, calc_renewal_date, calc_tool_costs)
@@ -9,7 +10,7 @@ from data import (load_data, save_data, blank_project, blank_line,
                   compute_master_totals, project_contracted_total,
                   wo_project_total, flat_invoice_rows, get_all_notifications,
                   get_fy_options, project_in_fy, project_hours_summary,
-                  count_tool_users, tool_share_costs)
+                  count_tool_users, tool_share_costs, gist_configured)
 
 st.set_page_config(page_title="PM Dashboard", page_icon="📁", layout="wide")
 
@@ -235,6 +236,18 @@ with st.sidebar:
         <span style="font-size: 12px; color: #475569 !important;">Project Manager</span>
     </div>
     """, unsafe_allow_html=True)
+
+    # Storage status + manual backup
+    if gist_configured():
+        st.caption("💾 Cloud storage: on (Gist)")
+    else:
+        st.caption("⚠️ Local only — data resets on redeploy")
+    st.download_button(
+        "⬇️ Download backup (JSON)",
+        json.dumps(st.session_state.data, indent=2),
+        "dashboard_progress.json", "application/json",
+        use_container_width=True, key="sidebar_backup",
+    )
 
 page = st.session_state.page
 

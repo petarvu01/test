@@ -1,5 +1,6 @@
 """Data management — load, save, compute totals, notifications."""
 import json
+import os
 import shutil
 from datetime import date, datetime
 from pathlib import Path
@@ -8,6 +9,7 @@ from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
                      fy_range, calc_payment_due, calc_renewal_date, calc_tool_costs)
 
 DATA_FILE = Path(__file__).parent / "dashboard_progress.json"
+GIST_FILENAME = "dashboard_progress.json"
 MAX_BACKUPS = 10
 
 # ─── Default project template ────────────────────────────────────────────
@@ -95,41 +97,149 @@ def default_data():
     }
 
 
-def load_data() -> dict:
+# ─── GitHub Gist storage (durable, survives Streamlit redeploys) ──────────
+def _gist_config():
+    """Return (token, gist_id) from Streamlit secrets or env vars; (None, None) if unset."""
+    token = gist_id = None
+    try:
+        import streamlit as st
+        if "github" in st.secrets:
+            token = st.secrets["github"].get("token")
+            gist_id = st.secrets["github"].get("gist_id")
+    except Exception:
+        pass
+    token = token or os.environ.get("GITHUB_TOKEN")
+    gist_id = gist_id or os.environ.get("GIST_ID")
+    return token, gist_id
+
+
+def gist_configured() -> bool:
+    token, gist_id = _gist_config()
+    return bool(token and gist_id)
+
+
+def _load_from_gist():
+    """Return parsed dict from the gist, or None if not configured / unreachable.
+    An empty gist returns {} (distinct from None) so callers can seed it safely."""
+    token, gist_id = _gist_config()
+    if not token or not gist_id:
+        return None
+    try:
+        import requests
+        r = requests.get(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"token {token}",
+                     "Accept": "application/vnd.github+json"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        files = r.json().get("files", {})
+        f = files.get(GIST_FILENAME)
+        if not f:
+            return {}
+        content = f.get("content", "")
+        if f.get("truncated") and f.get("raw_url"):
+            content = requests.get(f["raw_url"], timeout=10).text
+        content = (content or "").strip()
+        if not content:
+            return {}
+        return json.loads(content)
+    except Exception:
+        return None
+
+
+def _save_to_gist(data: dict) -> bool:
+    token, gist_id = _gist_config()
+    if not token or not gist_id:
+        return False
+    try:
+        import requests
+        payload = {"files": {GIST_FILENAME: {"content": json.dumps(data, indent=4)}}}
+        r = requests.patch(
+            f"https://api.github.com/gists/{gist_id}",
+            headers={"Authorization": f"token {token}",
+                     "Accept": "application/vnd.github+json"},
+            json=payload, timeout=10,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _read_local():
+    """Raw read of the local cache file, or None."""
     if not DATA_FILE.exists():
-        return default_data()
+        return None
     try:
         with DATA_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        pr = data.get("project_records", {})
-        for proj in pr.values():
-            for key, default in [("notes",""), ("start_date",""), ("end_date",""),
-                                  ("extension_date",""), ("hours_budget",0.0),
-                                  ("hours_log",[]), ("assigned_tools",[])]:
-                proj.setdefault(key, default)
-            # Migrate old Hours-tab project-level budget into the new contracted_hours
-            # field so existing data carries over the first time the new app opens it.
-            if "contracted_hours" not in proj:
-                proj["contracted_hours"] = float(proj.get("hours_budget", 0.0))
-            proj["lines"] = [validate_line(l) for l in proj.get("lines", [])]
-            if not proj["lines"]:
-                proj["lines"] = [blank_line()]
-        data["project_records"] = pr
-        data.setdefault("student_credits", [])
-        data.setdefault("invoices", [])
-        data.setdefault("tools", [])
-        return data
+            return json.load(f)
     except Exception:
-        return default_data()
+        return None
 
 
-def save_data(data: dict):
+def _write_local(data: dict):
     try:
         with DATA_FILE.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
-        _auto_backup()
     except OSError:
         pass
+
+
+def _normalize(data: dict) -> dict:
+    """Apply field defaults and per-line migrations to a loaded data dict."""
+    pr = data.get("project_records", {})
+    for proj in pr.values():
+        for key, default in [("notes",""), ("start_date",""), ("end_date",""),
+                              ("extension_date",""), ("hours_budget",0.0),
+                              ("hours_log",[]), ("assigned_tools",[])]:
+            proj.setdefault(key, default)
+        # Migrate old Hours-tab project-level budget into the new contracted_hours field.
+        if "contracted_hours" not in proj:
+            proj["contracted_hours"] = float(proj.get("hours_budget", 0.0))
+        proj["lines"] = [validate_line(l) for l in proj.get("lines", [])]
+        if not proj["lines"]:
+            proj["lines"] = [blank_line()]
+    data["project_records"] = pr
+    data.setdefault("student_credits", [])
+    data.setdefault("invoices", [])
+    data.setdefault("tools", [])
+    return data
+
+
+def load_data() -> dict:
+    # 1. Prefer the gist (the durable source of truth on Streamlit Cloud).
+    gist_data = _load_from_gist()
+    if gist_data is not None:
+        if gist_data:  # gist has real content
+            data = _normalize(gist_data)
+            _write_local(data)      # refresh local cache
+            return data
+        # Gist is configured but EMPTY → seed it from local cache or defaults (once).
+        seed = _normalize(_read_local() or default_data())
+        _save_to_gist(seed)
+        _write_local(seed)
+        return seed
+    # 2. Gist not configured or unreachable → use local cache, never overwrite the gist.
+    local = _read_local()
+    if local is not None:
+        try:
+            return _normalize(local)
+        except Exception:
+            return default_data()
+    # 3. Nothing anywhere yet → defaults.
+    return default_data()
+
+
+def save_data(data: dict):
+    # Always write the local cache (fast, and a fallback if the gist is briefly down).
+    _write_local(data)
+    try:
+        _auto_backup()
+    except Exception:
+        pass
+    # Push to the durable gist store.
+    _save_to_gist(data)
 
 
 def _auto_backup():
