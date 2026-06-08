@@ -751,7 +751,7 @@ elif page == "Credits":
             on_select="rerun", selection_mode="single-row", key="credits_table",
         )
         sel = event.selection.rows
-        if sel:
+        if sel and sel[0] < len(credits):
             i = sel[0]
             st.caption(f"Selected: **{credits[i]['name']}** ({credits[i]['student_id']})")
             if st.button("🗑️ Remove Student"):
@@ -1051,7 +1051,7 @@ elif page == "Invoices / WO":
         # Quick actions on the selected row (click a row above)
         st.subheader("Quick Actions")
         sel = event.selection.rows
-        if sel:
+        if sel and sel[0] < len(flat):
             r = flat[sel[0]]
             st.caption(f"Selected: {r['type']} #{r['number']} — {r['project']} — ${r['inst_amount']:,.2f}")
             qc1, qc2, qc3 = st.columns([1, 1, 1])
@@ -1202,7 +1202,7 @@ elif page == "Tools":
 
         # Toggle paid / Delete on the selected row
         sel = event.selection.rows
-        if sel:
+        if sel and sel[0] < len(tools):
             i = sel[0]
             st.caption(f"Selected: **{tools[i].get('name', '')}**")
             b1, b2 = st.columns(2)
