@@ -204,6 +204,23 @@ def _normalize(data: dict) -> dict:
     data.setdefault("student_credits", [])
     data.setdefault("invoices", [])
     data.setdefault("tools", [])
+    for t in data["tools"]:
+        if isinstance(t, dict):
+            t.setdefault("split_amounts", {})
+            # Migrate the earlier percent-based 'allocations' to dollar amounts
+            # (percent of the billing-cycle cost), then drop the old field.
+            old = t.pop("allocations", None)
+            if old and not t["split_amounts"]:
+                try:
+                    valid = {p: float(v) for p, v in old.items() if float(v) > 0}
+                    total = sum(valid.values())
+                    cost = float(t.get("cost", 0))
+                    if total > 0 and cost > 0:
+                        t["split_amounts"] = {p: round(cost * v / total, 2)
+                                              for p, v in valid.items()}
+                except (TypeError, ValueError):
+                    pass
+    data.setdefault("overview_kpis", list(DEFAULT_KPIS))
     return data
 
 
@@ -313,15 +330,101 @@ def count_tool_users(data: dict, tool_name: str) -> int:
                if tool_name in proj.get("assigned_tools", []))
 
 
-def tool_share_costs(data: dict, tool: dict):
-    """Return (monthly_share, annual_share) — this tool's cost divided equally
-    among the projects it's assigned to. (0, 0) if no projects use it."""
-    from helpers import calc_tool_costs  # local import to avoid cycle
-    n = count_tool_users(data, tool.get("name", ""))
-    if n <= 0:
+def tool_users(data: dict, tool_name: str) -> list:
+    """Sorted list of project names that have this tool assigned."""
+    if not tool_name:
+        return []
+    return sorted(name for name, proj in data.get("project_records", {}).items()
+                  if tool_name in proj.get("assigned_tools", []))
+
+
+def tool_split_amounts(data: dict, tool: dict) -> dict:
+    """Custom dollar split over the tool's CURRENT users, in billing-cycle units
+    ({project: dollars}). Entries for unassigned projects are ignored.
+    Returns {} when no custom split is set (→ equal split applies)."""
+    users = tool_users(data, tool.get("name", ""))
+    sa = tool.get("split_amounts") or {}
+    out = {}
+    for p in users:
+        try:
+            v = float(sa.get(p, 0))
+            if v > 0:
+                out[p] = v
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def tool_has_custom_split(data: dict, tool: dict) -> bool:
+    """True if the tool has at least one positive custom dollar amount
+    for a currently-assigned project."""
+    return bool(tool_split_amounts(data, tool))
+
+
+def tool_split_for(data: dict, tool: dict, project_name: str) -> float:
+    """This project's dollar share of the tool, in billing-cycle units.
+
+    Literal semantics: with a custom split, each project gets exactly the
+    amount entered for it (projects without an entry get 0). Without a custom
+    split, the tool's cost divides equally among its users."""
+    users = tool_users(data, tool.get("name", ""))
+    if project_name not in users:
+        return 0.0
+    custom = tool_split_amounts(data, tool)
+    if custom:
+        return custom.get(project_name, 0.0)
+    try:
+        cost = float(tool.get("cost", 0))
+    except (TypeError, ValueError):
+        cost = 0.0
+    return cost / len(users)
+
+
+def _cycle_amount_to_monthly_annual(amount: float, cycle: str):
+    """Convert a billing-cycle dollar amount to (monthly, annual) — mirrors
+    calc_tool_costs' conversion."""
+    if cycle == "Monthly":
+        return amount, amount * 12
+    if cycle == "Annual":
+        return round(amount / 12, 2), amount
+    if cycle == "2-Year":
+        return round(amount / 24, 2), round(amount / 2, 2)
+    return 0.0, 0.0  # One-time / unknown
+
+
+def tool_share_costs(data: dict, tool: dict, project_name: str = None):
+    """Return (monthly_share, annual_share) of this tool's cost.
+
+    With project_name: that project's share (literal custom $ if set, else equal).
+    Without:           the equal per-project share.
+    (0, 0) if no projects use the tool."""
+    users = tool_users(data, tool.get("name", ""))
+    if not users:
         return 0.0, 0.0
-    monthly, annual = calc_tool_costs(tool)
-    return monthly / n, annual / n
+    cycle = tool.get("billing_cycle", "Monthly")
+    if project_name is None:
+        try:
+            amt = float(tool.get("cost", 0)) / len(users)
+        except (TypeError, ValueError):
+            amt = 0.0
+    else:
+        amt = tool_split_for(data, tool, project_name)
+    return _cycle_amount_to_monthly_annual(amt, cycle)
+
+
+def tool_split_status(data: dict, tool: dict):
+    """Compare the entered custom split against the tool's cost.
+    Returns (entered_total, cost, diff) where diff = entered − cost,
+    or None when no custom split is set."""
+    custom = tool_split_amounts(data, tool)
+    if not custom:
+        return None
+    try:
+        cost = float(tool.get("cost", 0))
+    except (TypeError, ValueError):
+        cost = 0.0
+    entered = sum(custom.values())
+    return entered, cost, entered - cost
 
 
 def wo_project_total(data: dict, proj_name: str) -> float:
@@ -418,6 +521,16 @@ def get_all_notifications(data: dict) -> list:
         if abs(wo_t - contracted) > 0.01 and (wo_t > 0 or contracted > 0):
             notifs.append(("🔵", "WO Mismatch", name,
                            f"WO ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f} (diff ${abs(wo_t-contracted):,.2f})"))
+    # 3b. Tool split mismatches (entered $ split ≠ tool cost)
+    for t in data["tools"]:
+        status = tool_split_status(data, t)
+        if status:
+            entered, cost, diff = status
+            if abs(diff) > 0.01:
+                word = "unassigned" if diff < 0 else "over-assigned"
+                notifs.append(("🔵", "Tool Split Mismatch", t.get("name", ""),
+                               f"Split ${entered:,.2f} ≠ cost ${cost:,.2f} "
+                               f"(${abs(diff):,.2f} {word})"))
     # 4. Tool renewals
     for t in data["tools"]:
         if t.get("paid") or t.get("billing_cycle") == "One-time":
@@ -473,3 +586,86 @@ def project_in_fy(proj: dict, label: str) -> bool:
     if p_end:
         return fy_s <= p_end <= fy_e
     return False
+
+
+# ─── Overview KPIs (predefined, user-selectable) ──────────────────────────
+# Ordered (key, label) pairs — this is the menu users pick from.
+KPI_OPTIONS = [
+    ("active_projects",     "Active Projects"),
+    ("total_credits",       "Student Credits"),
+    ("total_budget",        "Total Budget"),
+    ("total_stu_personnel", "Personnel Cost"),
+    ("total_pi_cost",       "PI Cost"),
+    ("total_actuals",       "Total Actuals"),
+    ("total_cont_hours",    "Contracted Hours"),
+    ("total_hours_deducted","Hours Deducted"),
+    ("hours_remaining",     "Hours Remaining"),
+    ("unpaid_count",        "Unpaid Invoices"),
+    ("unpaid_amount",       "Unpaid Amount"),
+    ("overdue_count",       "Overdue Payments"),
+    ("tools_count",         "Tools"),
+    ("tools_annual",        "Tool Cost / yr"),
+    ("students_count",      "Student Workers (Credits tab)"),
+]
+DEFAULT_KPIS = ["active_projects", "total_credits", "total_budget", "total_stu_personnel"]
+KPI_LABELS = dict(KPI_OPTIONS)
+
+
+def compute_kpis(data: dict) -> dict:
+    """Compute every predefined KPI. Returns {key: formatted_value_string}."""
+    totals = compute_master_totals(data)
+    pr = data.get("project_records", {})
+
+    # Actuals = personnel + PI + actual travel + each project's tool share
+    actuals = 0.0
+    for name, proj in pr.items():
+        for r in proj.get("lines", []):
+            try:
+                actuals += int(r[1]) * float(r[2]) * float(r[3])   # student personnel
+                actuals += float(r[4]) * float(r[5])               # PI
+                actuals += float(r[8])                             # actual travel
+            except (TypeError, ValueError, IndexError):
+                pass
+        for tn in proj.get("assigned_tools", []):
+            t = next((x for x in data.get("tools", []) if x.get("name") == tn), None)
+            if t:
+                _, a = tool_share_costs(data, t, name)
+                actuals += a
+
+    cont_hours = sum(float(p.get("contracted_hours", 0) or 0) for p in pr.values())
+    hours_deducted = sum(project_hours_summary(p)[1] for p in pr.values()
+                         if float(p.get("contracted_hours", 0) or 0) > 0)
+
+    rows = flat_invoice_rows(data)
+    unpaid = [r for r in rows if not r["paid"]]
+    unpaid_amount = sum(r["inst_amount"] for r in unpaid)
+    today = date.today()
+    overdue = 0
+    for r in unpaid:
+        d = parse_date(r["payment_due"]) or parse_date(r["due_date"])
+        if d and d < today:
+            overdue += 1
+
+    tools = data.get("tools", [])
+    tools_annual = 0.0
+    for t in tools:
+        _, a = calc_tool_costs(t)
+        tools_annual += a
+
+    return {
+        "active_projects":      f"{totals['active_projects']}",
+        "total_credits":        f"{totals['total_credits']}",
+        "total_budget":         f"${totals['total_budget']:,.2f}",
+        "total_stu_personnel":  f"${totals['total_stu_personnel']:,.2f}",
+        "total_pi_cost":        f"${totals['total_pi_cost']:,.2f}",
+        "total_actuals":        f"${actuals:,.2f}",
+        "total_cont_hours":     f"{cont_hours:,.0f} hrs",
+        "total_hours_deducted": f"{hours_deducted:,.0f} hrs",
+        "hours_remaining":      f"{cont_hours - hours_deducted:,.0f} hrs",
+        "unpaid_count":         f"{len(unpaid)}",
+        "unpaid_amount":        f"${unpaid_amount:,.2f}",
+        "overdue_count":        f"{overdue}",
+        "tools_count":          f"{len(tools)}",
+        "tools_annual":         f"${tools_annual:,.2f}",
+        "students_count":       f"{len(data.get('student_credits', []))}",
+    }

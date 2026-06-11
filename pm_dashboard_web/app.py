@@ -10,7 +10,10 @@ from data import (load_data, save_data, blank_project, blank_line,
                   compute_master_totals, project_contracted_total,
                   wo_project_total, flat_invoice_rows, get_all_notifications,
                   get_fy_options, project_in_fy, project_hours_summary,
-                  count_tool_users, tool_share_costs, gist_configured)
+                  count_tool_users, tool_share_costs, gist_configured,
+                  tool_users, tool_split_for, tool_split_amounts,
+                  tool_has_custom_split, tool_split_status,
+                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS)
 
 st.set_page_config(page_title="PM Dashboard", page_icon="📁", layout="wide")
 
@@ -257,13 +260,40 @@ page = st.session_state.page
 # ═════════════════════════════════════════════════════════════════════════
 if page == "Overview":
     st.title("📊 Overview")
-    totals = compute_master_totals(D())
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Active Projects", totals["active_projects"])
-    c2.metric("Student Credits", totals["total_credits"])
-    c3.metric("Total Budget", f"${totals['total_budget']:,.2f}")
-    c4.metric("Personnel Cost", f"${totals['total_stu_personnel']:,.2f}")
+    # ── Configurable KPI board (shared — saved in the data file) ─────────
+    selected_kpis = [k for k in D().get("overview_kpis", DEFAULT_KPIS) if k in KPI_LABELS]
+    if not selected_kpis:
+        selected_kpis = list(DEFAULT_KPIS)
+    kpi_values = compute_kpis(D())
+
+    for start in range(0, len(selected_kpis), 4):
+        chunk = selected_kpis[start:start + 4]
+        cols = st.columns(4)
+        for col, key in zip(cols, chunk):
+            col.metric(KPI_LABELS[key], kpi_values.get(key, "—"))
+
+    with st.expander("⚙️ Customize KPIs"):
+        st.caption("Pick which metrics show on the Overview. The selection is saved "
+                   "with the shared data, so everyone sees the same board.")
+        all_labels = [label for _, label in KPI_OPTIONS]
+        label_to_key = {label: key for key, label in KPI_OPTIONS}
+        current_labels = [KPI_LABELS[k] for k in selected_kpis]
+        picked = st.multiselect("Visible KPIs (shown in this order)", all_labels,
+                                default=current_labels, key="kpi_picker")
+        kc1, kc2 = st.columns([1, 1])
+        if kc1.button("💾 Save KPIs"):
+            if picked:
+                D()["overview_kpis"] = [label_to_key[l] for l in picked]
+                save()
+                st.toast("KPI board saved")
+                st.rerun()
+            else:
+                st.error("Pick at least one KPI.")
+        if kc2.button("↩️ Reset to default"):
+            D()["overview_kpis"] = list(DEFAULT_KPIS)
+            save()
+            st.rerun()
 
     col_left, col_right = st.columns([2, 3])
 
@@ -530,13 +560,17 @@ elif page == "Project View":
             t = next((t for t in D()["tools"] if t.get("name") == tn), None)
             if t:
                 full_mc, full_ac = calc_tool_costs(t)
-                share_mc, share_ac = tool_share_costs(D(), t)
+                share_mc, share_ac = tool_share_costs(D(), t, active)
                 n_users = count_tool_users(D(), tn)
+                cycle = t.get("billing_cycle", "Monthly")
+                split_label = (f"{n_users} project{'s' if n_users != 1 else ''}"
+                               + (" (custom $)" if tool_has_custom_split(D(), t) else ""))
                 total_m_share += share_mc; total_a_share += share_ac
                 tool_data.append({
                     "Tool": tn, "Vendor": t.get("vendor", ""),
                     "Full Annual": f"${full_ac:,.2f}",
-                    "Split among": f"{n_users} project{'s' if n_users != 1 else ''}",
+                    "Split among": split_label,
+                    f"Share / {cycle.lower()}": f"${tool_split_for(D(), t, active):,.2f}",
                     "Your share / mo": f"${share_mc:,.2f}",
                     "Your share / yr": f"${share_ac:,.2f}",
                 })
@@ -547,7 +581,55 @@ elif page == "Project View":
         st.dataframe(pd.DataFrame(tool_data), use_container_width=True, hide_index=True)
         st.markdown(f"**This project's share: ${total_m_share:,.2f}/mo · "
                     f"${total_a_share:,.2f}/yr**")
-        st.caption("Tool costs are split equally among the projects using each tool.")
+        st.caption("Shared tools split equally by default; enter custom $ amounts below "
+                   "or on the Tools tab.")
+
+        # ── Inline $ split editor ──────────────────────────────────────
+        shared_tools = [tn for tn in assigned if count_tool_users(D(), tn) >= 2]
+        if shared_tools:
+            with st.expander("✏️ Edit cost split ($)"):
+                pick = st.selectbox("Tool", shared_tools, key=f"pv_split_tool_{active}")
+                t_sel = next((x for x in D()["tools"] if x.get("name") == pick), None)
+                if t_sel:
+                    users = tool_users(D(), pick)
+                    cycle = t_sel.get("billing_cycle", "Monthly")
+                    try:
+                        cost = float(t_sel.get("cost", 0))
+                    except (TypeError, ValueError):
+                        cost = 0.0
+                    st.caption(f"{cycle} cost: **${cost:,.2f}** — enter each project's "
+                               f"dollar amount per {cycle.lower()} period.")
+                    sa = t_sel.get("split_amounts") or {}
+                    equal_amt = round(cost / len(users), 2) if users else 0.0
+                    amt_inputs = {}
+                    cols = st.columns(min(len(users), 4))
+                    for j, p in enumerate(users):
+                        default_amt = float(sa.get(p, equal_amt) or 0.0)
+                        with cols[j % len(cols)]:
+                            amt_inputs[p] = st.number_input(
+                                f"{p} ($)", min_value=0.0, value=default_amt,
+                                step=5.0, format="%.2f",
+                                key=f"pv_split_{active}_{pick}_{p}",
+                            )
+                    entered = sum(amt_inputs.values())
+                    diff = entered - cost
+                    if abs(diff) > 0.01:
+                        word = "unassigned" if diff < 0 else "over-assigned"
+                        st.warning(f"Entered ${entered:,.2f} of ${cost:,.2f} — "
+                                   f"${abs(diff):,.2f} {word}.")
+                    else:
+                        st.caption(f"✓ Matches the {cycle.lower()} cost (${cost:,.2f})")
+                    pc1, pc2 = st.columns(2)
+                    if pc1.button("💾 Save Split", key=f"pv_save_split_{active}_{pick}"):
+                        t_sel["split_amounts"] = {p: float(v) for p, v in amt_inputs.items()}
+                        save()
+                        st.toast("Split saved")
+                        st.rerun()
+                    if pc2.button("↩️ Reset to equal split", key=f"pv_reset_split_{active}_{pick}"):
+                        t_sel["split_amounts"] = {}
+                        save()
+                        st.rerun()
+
         rem_tool = st.selectbox("Remove tool", assigned, key="rem_tool")
         if st.button("Remove Tool"):
             assigned.remove(rem_tool)
@@ -647,7 +729,7 @@ elif page == "Actual vs Budget":
         for tn in proj.get("assigned_tools", []):
             t = next((x for x in D()["tools"] if x.get("name") == tn), None)
             if t:
-                _, annual_share = tool_share_costs(D(), t)
+                _, annual_share = tool_share_costs(D(), t, name)
                 tools_actual += annual_share
 
         budget = cont_personnel + cont_pi + cont_indirect + cont_fringe + cont_travel
@@ -1179,7 +1261,12 @@ elif page == "Tools":
             mc, ac = calc_tool_costs(t)
             renewal = calc_renewal_date(t)
             n_users = count_tool_users(D(), t.get("name", ""))
-            per_proj = f"${ac / n_users:,.2f}" if n_users > 0 else "—"
+            if n_users <= 0:
+                per_proj = "—"
+            elif tool_has_custom_split(D(), t):
+                per_proj = "custom"
+            else:
+                per_proj = f"${ac / n_users:,.2f}"
             tool_data.append({
                 "Tool": t.get("name", ""),
                 "Vendor": t.get("vendor", ""),
@@ -1214,8 +1301,69 @@ elif page == "Tools":
                 tools.pop(i)
                 save()
                 st.rerun()
+
+            # ── Cost split editor (only meaningful when 2+ projects share it) ──
+            t_sel = tools[i]
+            users = tool_users(D(), t_sel.get("name", ""))
+            if len(users) >= 2:
+                cycle = t_sel.get("billing_cycle", "Monthly")
+                try:
+                    cost = float(t_sel.get("cost", 0))
+                except (TypeError, ValueError):
+                    cost = 0.0
+                _, full_annual = calc_tool_costs(t_sel)
+                st.markdown("**Cost split across projects ($)**")
+                st.caption(f"{cycle} cost **${cost:,.2f}** (${full_annual:,.2f}/yr). "
+                           f"Enter each project's dollar amount per {cycle.lower()} "
+                           "period — equal split applies until you save a custom one. "
+                           "Projects left at $0 are charged nothing.")
+                sa = t_sel.get("split_amounts") or {}
+                equal_amt = round(cost / len(users), 2)
+                amt_inputs = {}
+                cols = st.columns(min(len(users), 4))
+                for j, p in enumerate(users):
+                    default_amt = float(sa.get(p, equal_amt) or 0.0)
+                    with cols[j % len(cols)]:
+                        amt_inputs[p] = st.number_input(
+                            f"{p} ($)", min_value=0.0, value=default_amt,
+                            step=5.0, format="%.2f",
+                            key=f"alloc_{i}_{p}",
+                        )
+                entered = sum(amt_inputs.values())
+                diff = entered - cost
+                if abs(diff) > 0.01:
+                    word = "unassigned" if diff < 0 else "over-assigned"
+                    st.warning(f"Entered ${entered:,.2f} of ${cost:,.2f} — "
+                               f"${abs(diff):,.2f} {word}. Amounts are kept exactly "
+                               "as typed.")
+                else:
+                    st.caption(f"✓ Matches the {cycle.lower()} cost (${cost:,.2f})")
+                sc1, sc2 = st.columns(2)
+                if sc1.button("💾 Save Split", key=f"save_split_{i}"):
+                    t_sel["split_amounts"] = {p: float(v) for p, v in amt_inputs.items()}
+                    save()
+                    st.toast("Custom $ split saved")
+                    st.rerun()
+                if sc2.button("↩️ Reset to equal split", key=f"reset_split_{i}"):
+                    t_sel["split_amounts"] = {}
+                    save()
+                    st.rerun()
+                # Preview of resulting annual shares (exactly as entered, annualized)
+                from data import _cycle_amount_to_monthly_annual
+                preview = []
+                for p, v in amt_inputs.items():
+                    pm, pa = _cycle_amount_to_monthly_annual(v, cycle)
+                    preview.append({"Project": p,
+                                    f"$ / {cycle.lower()}": f"${v:,.2f}",
+                                    "$ / mo": f"${pm:,.2f}",
+                                    "$ / yr": f"${pa:,.2f}"})
+                st.dataframe(pd.DataFrame(preview), use_container_width=True,
+                             hide_index=True)
+            elif len(users) == 1:
+                st.caption(f"Only **{users[0]}** uses this tool — it bears the full cost. "
+                           "Assign the tool to more projects to split it.")
         else:
-            st.caption("Click a row above to toggle Paid or delete a tool.")
+            st.caption("Click a row above to toggle Paid, delete, or set a cost split.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
