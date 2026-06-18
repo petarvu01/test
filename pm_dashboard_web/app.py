@@ -11,6 +11,7 @@ from data import (load_data, save_data, blank_project, blank_line,
                   wo_project_total, flat_invoice_rows, get_all_notifications,
                   get_fy_options, project_in_fy, project_hours_summary,
                   count_tool_users, tool_share_costs, gist_configured,
+                  fy_funding_rows, fy_carry_in_for,
                   tool_users, tool_split_for, tool_split_amounts,
                   tool_has_custom_split, tool_split_status,
                   compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS)
@@ -393,18 +394,39 @@ elif page == "Project View":
 
     proj = pr[active]
 
+    # ── Project Status ───────────────────────────────────────────────
+    status_options = ["Active", "On Pause", "Finished"]
+    badge = {"Active": "🟢", "On Pause": "🟡", "Finished": "⚪"}
+    cur_status = proj.get("status", "Active")
+    if cur_status not in status_options:
+        cur_status = "Active"
+    stc1, stc2 = st.columns([2, 3])
+    with stc1:
+        new_status = st.selectbox(
+            "Project Status", status_options,
+            index=status_options.index(cur_status),
+            key=f"proj_status_{active}",
+        )
+    # Auto-save on change (per-project key keeps each project independent)
+    if new_status != cur_status:
+        proj["status"] = new_status
+        save()
+        st.toast(f"Status set to {new_status}")
+    stc2.markdown(f"### {badge.get(new_status, '')} {new_status}")
+
     # Dates
     st.subheader("Project Dates")
     dc1, dc2, dc3, dc4 = st.columns([2, 2, 2, 1])
     sd = dc1.date_input("Start Date", value=parse_date(proj.get("start_date", "")),
-                        key="proj_start", format="YYYY-MM-DD")
+                        key=f"proj_start_{active}", format="YYYY-MM-DD")
     ed = dc2.date_input("End Date", value=parse_date(proj.get("end_date", "")),
-                        key="proj_end", format="YYYY-MM-DD")
+                        key=f"proj_end_{active}", format="YYYY-MM-DD")
     ext = dc3.date_input("Extension", value=parse_date(proj.get("extension_date", "")),
-                         key="proj_ext", format="YYYY-MM-DD")
-    no_budget = dc4.checkbox("No Budget", value=proj.get("has_budget", False), key="nb_chk")
+                         key=f"proj_ext_{active}", format="YYYY-MM-DD")
+    no_budget = dc4.checkbox("No Budget", value=proj.get("has_budget", False),
+                             key=f"nb_chk_{active}")
 
-    if st.button("💾 Save Dates"):
+    if st.button("💾 Save Dates", key=f"save_dates_{active}"):
         proj["start_date"] = str(sd) if sd else ""
         proj["end_date"] = str(ed) if ed else ""
         proj["extension_date"] = str(ext) if ext else ""
@@ -449,6 +471,109 @@ elif page == "Project View":
             st.rerun()
         st.caption("No contracted hours set — hours-deduction tracking is off for this "
                    "project. Set a value above to turn it on.")
+
+    # ── FY Funding (per-fiscal-year running balance, with carry-over) ──
+    st.markdown("---")
+    st.subheader("💵 FY Funding (carry-over budget & hours)")
+    st.caption(
+        "A per-fiscal-year running balance for **budget ($) and hours**, separate "
+        "from the line-item budget — this does **not** affect the Master table or "
+        "Budget vs Actual. Enter what was **Added** each FY and the current "
+        "**Remaining**; unused balance rolls into the next FY's *Carried in* "
+        "automatically once that year ends (after May 31)."
+    )
+
+    fy_ledger = proj.setdefault("fy_funding", {})
+
+    # Existing ledger as a derived summary table (read-only).
+    fy_rows = fy_funding_rows(proj)
+    if fy_rows:
+        summary = [{
+            "Fiscal Year": fy_label(r["year"]),
+            "Carried in $": f"${r['carried_in']:,.2f}",
+            "Added $": f"${r['added']:,.2f}",
+            "Available $": f"${r['available']:,.2f}",
+            "Remaining $": f"${r['remaining']:,.2f}",
+            "Spent $": f"${r['spent']:,.2f}",
+            "Hrs Carried": f"{r['h_carried_in']:,.1f}",
+            "Hrs Added": f"{r['h_added']:,.1f}",
+            "Hrs Avail": f"{r['h_available']:,.1f}",
+            "Hrs Remaining": f"{r['h_remaining']:,.1f}",
+        } for r in fy_rows]
+        st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No FY funding recorded yet. Pick a fiscal year below to start.")
+
+    # Editor for one FY.
+    fy_opts = get_fy_options(D())
+    fy_opts = [o for o in fy_opts if o != "All"]
+    this_fy = fy_label(date_to_fy(date.today()))
+    if this_fy not in fy_opts:
+        fy_opts.append(this_fy)
+    fy_opts = sorted(set(fy_opts))
+    default_idx = fy_opts.index(this_fy) if this_fy in fy_opts else 0
+
+    sel_label = st.selectbox("Edit fiscal year", fy_opts, index=default_idx,
+                             key=f"fy_fund_pick_{active}")
+    sel_year = int(sel_label.split()[1].split("-")[0])
+    sel_key = str(sel_year)
+    entry = fy_ledger.get(sel_key, {})
+
+    # Derived carry-in for the selected year (from the prior ended FY).
+    cin_dollars, cin_hours = fy_carry_in_for(proj, sel_year)
+    ended = date.today() > date(sel_year + 1, 5, 31)
+
+    fcc1, fcc2, fcc3 = st.columns(3)
+    fcc1.metric("Carried in $", f"${cin_dollars:,.2f}")
+    fcc2.metric("Carried in hrs", f"{cin_hours:,.1f}")
+    fcc3.metric("FY status", "Ended" if ended else "In progress")
+
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        add_d = st.number_input(
+            f"Budget added in {sel_label} ($)",
+            value=float(entry.get("added") or 0.0), min_value=0.0, step=100.0,
+            format="%.2f", key=f"fy_add_d_{active}_{sel_key}")
+        rem_default_d = cin_dollars + add_d
+        stored_rem_d = entry.get("remaining")
+        rem_d = st.number_input(
+            "Remaining $ (what's left now)",
+            value=float(rem_default_d if stored_rem_d is None else stored_rem_d),
+            min_value=0.0, step=100.0, format="%.2f",
+            key=f"fy_rem_d_{active}_{sel_key}")
+    with ec2:
+        add_h = st.number_input(
+            f"Hours added in {sel_label}",
+            value=float(entry.get("hours_added") or 0.0), min_value=0.0, step=1.0,
+            format="%.1f", key=f"fy_add_h_{active}_{sel_key}")
+        rem_default_h = cin_hours + add_h
+        stored_rem_h = entry.get("hours_remaining")
+        rem_h = st.number_input(
+            "Remaining hours (what's left now)",
+            value=float(rem_default_h if stored_rem_h is None else stored_rem_h),
+            min_value=0.0, step=1.0, format="%.1f",
+            key=f"fy_rem_h_{active}_{sel_key}")
+
+    avail_d = cin_dollars + add_d
+    avail_h = cin_hours + add_h
+    st.caption(
+        f"Available this FY: **${avail_d:,.2f}** / **{avail_h:,.1f} hrs** "
+        f"(Carried in + Added). Spent so far: ${avail_d - rem_d:,.2f} / "
+        f"{avail_h - rem_h:,.1f} hrs."
+    )
+    if rem_d > avail_d + 0.005 or rem_h > avail_h + 0.005:
+        st.warning("Remaining is larger than Available — double-check the numbers.")
+
+    if st.button("💾 Save FY Funding", key=f"fy_save_{active}_{sel_key}"):
+        fy_ledger[sel_key] = {
+            "added": float(add_d),
+            "remaining": float(rem_d),
+            "hours_added": float(add_h),
+            "hours_remaining": float(rem_h),
+        }
+        save()
+        st.toast(f"{sel_label} funding saved")
+        st.rerun()
 
     # ── Line items (editable grid) ─────────────────────────────────────
     st.subheader("Line Items")

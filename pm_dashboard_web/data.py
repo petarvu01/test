@@ -55,9 +55,11 @@ def blank_line(name="Phase 1 - Setup"):
 def blank_project(code, name, has_budget=False):
     return {
         "code": code, "has_budget": has_budget,
+        "status": "Active",
         "start_date": "", "end_date": "", "extension_date": "",
         "notes": "", "hours_budget": 0.0, "hours_log": [],
         "contracted_hours": 0.0,
+        "fy_funding": {},
         "assigned_tools": [],
         "lines": [blank_line("Phase 1 - Setup"), blank_line("Phase 2 - Core Dev")],
     }
@@ -192,7 +194,8 @@ def _normalize(data: dict) -> dict:
     for proj in pr.values():
         for key, default in [("notes",""), ("start_date",""), ("end_date",""),
                               ("extension_date",""), ("hours_budget",0.0),
-                              ("hours_log",[]), ("assigned_tools",[])]:
+                              ("hours_log",[]), ("assigned_tools",[]),
+                              ("status","Active"), ("fy_funding",{})]:
             proj.setdefault(key, default)
         # Migrate old Hours-tab project-level budget into the new contracted_hours field.
         if "contracted_hours" not in proj:
@@ -320,6 +323,71 @@ def project_hours_summary(proj: dict):
         except (TypeError, ValueError):
             pass
     return budget, deducted
+
+
+# ─── FY Funding (per-fiscal-year running balance, with carry-over) ────────
+# Stored per project as proj["fy_funding"] = {
+#     "2026": {"added": 10000.0, "remaining": 1000.0,
+#              "hours_added": 100.0, "hours_remaining": 50.0}, ...
+# }
+# "remaining" / "hours_remaining" may be None → defaults to Available (nothing
+# spent yet). Carry-in is DERIVED (never stored), so the whole ledger is
+# re-computable and idempotent: a year's unused balance becomes the next
+# ledger year's carry-in automatically, but only once that year has ended.
+
+def _fy_ended(year: int) -> bool:
+    """True once the fiscal year (Jun 1 of `year` → May 31 of year+1) is over."""
+    try:
+        return date.today() > date(year + 1, 5, 31)
+    except Exception:
+        return False
+
+
+def fy_funding_rows(proj: dict) -> list:
+    """Derived per-FY rows in ascending year order.
+
+    Each row: year, carried_in, added, available, remaining, spent
+    (+ the h_* hours equivalents). Carry-in flows from the previous ledger
+    year's remaining, but only after that previous year has ended.
+    """
+    ledger = proj.get("fy_funding", {}) or {}
+    rows = []
+    prev_year = None
+    prev_rem = 0.0
+    prev_hrem = 0.0
+    for y in sorted(int(k) for k in ledger):
+        e = ledger.get(str(y), {}) or {}
+        added = float(e.get("added") or 0)
+        hadded = float(e.get("hours_added") or 0)
+        if prev_year is not None and _fy_ended(prev_year):
+            cin, hcin = prev_rem, prev_hrem
+        else:
+            cin, hcin = 0.0, 0.0
+        avail = cin + added
+        havail = hcin + hadded
+        rem = e.get("remaining")
+        rem = avail if rem is None else float(rem)
+        hrem = e.get("hours_remaining")
+        hrem = havail if hrem is None else float(hrem)
+        rows.append({
+            "year": y, "carried_in": cin, "added": added,
+            "available": avail, "remaining": rem, "spent": avail - rem,
+            "h_carried_in": hcin, "h_added": hadded, "h_available": havail,
+            "h_remaining": hrem, "h_spent": havail - hrem,
+        })
+        prev_year, prev_rem, prev_hrem = y, rem, hrem
+    return rows
+
+
+def fy_carry_in_for(proj: dict, year: int) -> tuple:
+    """($ carry-in, hours carry-in) for a (possibly not-yet-created) FY,
+    taken from the most recent earlier ledger year that has already ended."""
+    prior = [r for r in fy_funding_rows(proj) if r["year"] < year]
+    if prior:
+        last = prior[-1]
+        if _fy_ended(last["year"]):
+            return last["remaining"], last["h_remaining"]
+    return 0.0, 0.0
 
 
 def count_tool_users(data: dict, tool_name: str) -> int:
