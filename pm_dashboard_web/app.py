@@ -534,8 +534,8 @@ elif page == "Project View":
 
     # Notes
     st.subheader("Notes")
-    notes = st.text_area("Project notes", value=proj.get("notes", ""), key="proj_notes")
-    if st.button("💾 Save Notes"):
+    notes = st.text_area("Project notes", value=proj.get("notes", ""), key=f"proj_notes_{active}")
+    if st.button("💾 Save Notes", key=f"save_notes_{active}"):
         proj["notes"] = notes
         save()
         st.toast("Notes saved")
