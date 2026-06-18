@@ -534,7 +534,13 @@ elif page == "Project View":
 
     # Notes
     st.subheader("Notes")
+    st.caption(f"Notes for: **{active}** (each project keeps its own)")
     notes = st.text_area("Project notes", value=proj.get("notes", ""), key=f"proj_notes_{active}")
+    # Write straight to THIS project. Auto-saves on change so switching
+    # projects never mixes or loses notes, even if you forget the button.
+    if notes != proj.get("notes", ""):
+        proj["notes"] = notes
+        save()
     if st.button("💾 Save Notes", key=f"save_notes_{active}"):
         proj["notes"] = notes
         save()
