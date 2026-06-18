@@ -13,7 +13,8 @@ from data import (load_data, save_data, blank_project, blank_line,
                   count_tool_users, tool_share_costs, gist_configured,
                   tool_users, tool_split_for, tool_split_amounts,
                   tool_has_custom_split, tool_split_status,
-                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS)
+                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS,
+                  TEMPLATE_PLACEHOLDERS, build_placeholder_map)
 
 st.set_page_config(page_title="PM Dashboard", page_icon="📁", layout="wide")
 
@@ -187,6 +188,8 @@ NAV_ITEMS = [
     ("👥", "Student Workers"),
     ("📄", "Invoices / WO"),
     ("🛠️", "Tools"),
+    ("👤", "Clients"),
+    ("📝", "Templates"),
     ("🆚", "Results"),
 ]
 
@@ -397,12 +400,12 @@ elif page == "Project View":
     st.subheader("Project Dates")
     dc1, dc2, dc3, dc4 = st.columns([2, 2, 2, 1])
     sd = dc1.date_input("Start Date", value=parse_date(proj.get("start_date", "")),
-                        key="proj_start", format="YYYY-MM-DD")
+                        key=f"proj_start_{active}", format="YYYY-MM-DD")
     ed = dc2.date_input("End Date", value=parse_date(proj.get("end_date", "")),
-                        key="proj_end", format="YYYY-MM-DD")
+                        key=f"proj_end_{active}", format="YYYY-MM-DD")
     ext = dc3.date_input("Extension", value=parse_date(proj.get("extension_date", "")),
-                         key="proj_ext", format="YYYY-MM-DD")
-    no_budget = dc4.checkbox("No Budget", value=proj.get("has_budget", False), key="nb_chk")
+                         key=f"proj_ext_{active}", format="YYYY-MM-DD")
+    no_budget = dc4.checkbox("No Budget", value=proj.get("has_budget", False), key=f"nb_chk_{active}")
 
     if st.button("💾 Save Dates"):
         proj["start_date"] = str(sd) if sd else ""
@@ -534,7 +537,7 @@ elif page == "Project View":
 
     # Notes
     st.subheader("Notes")
-    notes = st.text_area("Project notes", value=proj.get("notes", ""), key="proj_notes")
+    notes = st.text_area("Project notes", value=proj.get("notes", ""), key=f"proj_notes_{active}")
     if st.button("💾 Save Notes"):
         proj["notes"] = notes
         save()
@@ -1364,6 +1367,189 @@ elif page == "Tools":
                            "Assign the tool to more projects to split it.")
         else:
             st.caption("Click a row above to toggle Paid, delete, or set a cost split.")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# CLIENTS
+# ═════════════════════════════════════════════════════════════════════════
+elif page == "Clients":
+    st.title("👤 Clients Info")
+    st.caption("Manage client contact details per project. These fields are available "
+               "as `{{client_*}}` placeholders in the Templates tab.")
+    pr = D()["project_records"]
+
+    # ── Summary table of all projects + client info ───────────────────
+    st.subheader("All Projects")
+    summary = []
+    for name in sorted(pr.keys()):
+        cli = pr[name].get("client", {})
+        summary.append({
+            "Project": name,
+            "Code": pr[name].get("code", ""),
+            "Client Name": cli.get("name", ""),
+            "Company": cli.get("company", ""),
+            "Phone": cli.get("phone", ""),
+            "Email": cli.get("email", ""),
+        })
+    if summary:
+        st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+
+    # ── Per-project editor ────────────────────────────────────────────
+    st.subheader("Edit Client Info")
+    active = st.selectbox("Project", sorted(pr.keys()), key="client_proj")
+    proj = pr[active]
+    cli = proj.setdefault("client", {})
+    for ck in ("name", "position", "company", "address", "phone", "email"):
+        cli.setdefault(ck, "")
+
+    with st.form("client_form"):
+        cc = st.columns(2)
+        c_name = cc[0].text_input("Client Name", value=cli.get("name", ""),
+                                   key="cli_name")
+        c_pos = cc[1].text_input("Position / Title", value=cli.get("position", ""),
+                                  key="cli_pos")
+        cc2 = st.columns(2)
+        c_company = cc2[0].text_input("Company", value=cli.get("company", ""),
+                                       key="cli_company")
+        c_addr = cc2[1].text_input("Address (Street, City, ZIP)",
+                                    value=cli.get("address", ""), key="cli_addr")
+        cc3 = st.columns(2)
+        c_phone = cc3[0].text_input("Phone", value=cli.get("phone", ""),
+                                     key="cli_phone")
+        c_email = cc3[1].text_input("Email", value=cli.get("email", ""),
+                                     key="cli_email")
+
+        if st.form_submit_button("💾 Save Client Info"):
+            cli["name"] = c_name
+            cli["position"] = c_pos
+            cli["company"] = c_company
+            cli["address"] = c_addr
+            cli["phone"] = c_phone
+            cli["email"] = c_email
+            save()
+            st.toast(f"Client info saved for {active}")
+            st.rerun()
+
+    # Show the template placeholders this generates
+    with st.expander("📋 Template placeholders for this client"):
+        ref = [
+            ("{{client_name}}", cli.get("name", "")),
+            ("{{client_position}}", cli.get("position", "")),
+            ("{{client_company}}", cli.get("company", "")),
+            ("{{client_address}}", cli.get("address", "")),
+            ("{{client_phone}}", cli.get("phone", "")),
+            ("{{client_email}}", cli.get("email", "")),
+        ]
+        st.dataframe(pd.DataFrame(ref, columns=["Placeholder", "Value"]),
+                     use_container_width=True, hide_index=True)
+        st.caption("Use these in your .docx template — the Templates tab fills them "
+                   "automatically when you select this project.")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# TEMPLATES — Fill .docx with project data
+# ═════════════════════════════════════════════════════════════════════════
+elif page == "Templates":
+    st.title("📝 Templates")
+    st.caption("Upload a Word template (.docx) with `{{placeholder}}` tags. "
+               "Pick a project and optionally an invoice/WO record, then fill and download.")
+
+    # ── Step 1: Upload ──────────────────────────────────────────────────
+    uploaded = st.file_uploader("Upload .docx template", type=["docx"],
+                                key="template_upload")
+
+    # ── Step 2: Pick project + record ───────────────────────────────────
+    tc1, tc2 = st.columns(2)
+    tpl_proj = tc1.selectbox("Project", projects_sorted(), key="tpl_proj")
+    flat = flat_invoice_rows(D(), proj_filter=tpl_proj)
+    record_options = ["(None — project summary only)"] + [
+        f"{r['type']} #{r['number']} — ${r['inst_amount']:,.2f} — {r['description']}"
+        for r in flat
+    ]
+    rec_pick = tc2.selectbox("Invoice / WO record", record_options, key="tpl_rec")
+    rec_idx = record_options.index(rec_pick) - 1  # -1 = "None"
+    selected_row = flat[rec_idx] if rec_idx >= 0 else None
+
+    # ── Show current placeholder values ────────────────────────────────
+    mapping = build_placeholder_map(D(), tpl_proj, selected_row)
+    with st.expander("📋 Available placeholders and current values"):
+        ref_rows = []
+        for tag, desc in TEMPLATE_PLACEHOLDERS:
+            ref_rows.append({
+                "Placeholder": tag,
+                "Description": desc,
+                "Current Value": mapping.get(tag, ""),
+            })
+        st.dataframe(pd.DataFrame(ref_rows), use_container_width=True,
+                     hide_index=True, height=600)
+        st.caption("Copy any placeholder above into your .docx template. "
+                   "The app replaces every occurrence with the current value.")
+
+    # ── Step 3: Fill and download ───────────────────────────────────────
+    if uploaded is not None:
+        if st.button("📄 Fill Template & Download", type="primary"):
+            try:
+                from docx import Document
+                import io, copy, re
+
+                doc = Document(io.BytesIO(uploaded.getvalue()))
+
+                def replace_in_paragraph(para, mapping):
+                    """Join runs, replace all placeholders, redistribute to first run."""
+                    full = "".join(run.text for run in para.runs)
+                    if not any(tag in full for tag in mapping):
+                        return
+                    for tag, val in mapping.items():
+                        full = full.replace(tag, val)
+                    if para.runs:
+                        para.runs[0].text = full
+                        for run in para.runs[1:]:
+                            run.text = ""
+
+                # Body paragraphs
+                for para in doc.paragraphs:
+                    replace_in_paragraph(para, mapping)
+
+                # Tables
+                for table in doc.tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            for para in cell.paragraphs:
+                                replace_in_paragraph(para, mapping)
+
+                # Headers and footers
+                for section in doc.sections:
+                    for header_footer in [section.header, section.footer]:
+                        if header_footer is not None:
+                            for para in header_footer.paragraphs:
+                                replace_in_paragraph(para, mapping)
+                            for table in header_footer.tables:
+                                for row in table.rows:
+                                    for cell in row.cells:
+                                        for para in cell.paragraphs:
+                                            replace_in_paragraph(para, mapping)
+
+                buf = io.BytesIO()
+                doc.save(buf)
+                buf.seek(0)
+
+                safe_name = tpl_proj.replace(" ", "_")
+                rec_label = f"_{selected_row['number']}" if selected_row else ""
+                filename = f"{safe_name}{rec_label}_filled.docx"
+
+                st.download_button(
+                    "⬇️ Download filled document",
+                    buf.getvalue(), filename,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+                st.success(f"Filled {sum(1 for t in mapping if mapping[t])} placeholders.")
+
+            except ImportError:
+                st.error("python-docx is not installed. Add it to requirements.txt.")
+            except Exception as e:
+                st.error(f"Error filling template: {e}")
+    else:
+        st.info("Upload a .docx template above to get started.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
