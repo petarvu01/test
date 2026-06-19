@@ -59,6 +59,7 @@ def blank_project(code, name, has_budget=False):
         "start_date": "", "end_date": "", "extension_date": "",
         "notes": "", "hours_budget": 0.0, "hours_log": [],
         "contracted_hours": 0.0,
+        "contracted_hours_by_fy": {},
         "fy_funding": {},
         "assigned_tools": [],
         "lines_by_fy": {},
@@ -197,7 +198,7 @@ def _normalize(data: dict) -> dict:
                               ("extension_date",""), ("hours_budget",0.0),
                               ("hours_log",[]), ("assigned_tools",[]),
                               ("status","Active"), ("fy_funding",{}),
-                              ("lines_by_fy",{})]:
+                              ("lines_by_fy",{}), ("contracted_hours_by_fy",{})]:
             proj.setdefault(key, default)
         # Migrate old Hours-tab project-level budget into the new contracted_hours field.
         if "contracted_hours" not in proj:
@@ -217,6 +218,19 @@ def _normalize(data: dict) -> dict:
         # Keep the flat "lines" list as a synced view of every FY (so all the
         # whole-project totals that read proj["lines"] keep working unchanged).
         proj["lines"] = flatten_lines(proj) or [blank_line()]
+        # Per-FY contracted hours: migrate from last round's fy_funding hours,
+        # then from the legacy project-level contracted_hours, one time only.
+        if not proj.get("contracted_hours_by_fy"):
+            chf = {}
+            for y, e in (proj.get("fy_funding") or {}).items():
+                h = float((e or {}).get("hours_added") or 0)
+                if h:
+                    chf[str(y)] = h
+            if not chf:
+                legacy = float(proj.get("contracted_hours", 0.0) or 0)
+                if legacy:
+                    chf[str(project_primary_fy(proj))] = legacy
+            proj["contracted_hours_by_fy"] = chf
     data["project_records"] = pr
     data.setdefault("student_credits", [])
     data.setdefault("invoices", [])
@@ -320,13 +334,17 @@ def project_contracted_total(proj: dict) -> float:
 
 
 def project_hours_summary(proj: dict):
-    """Return (budget, deducted) hours for a project.
+    """Return (budget, deducted) hours for a project, whole-project totals.
 
-    Budget   = project-level contracted_hours (annual).
-    Deducted = sum over lines of (Students × Stu Hours) + PI Hours.
-               Many students can each log hours; PI is a single person.
+    Budget   = sum of per-FY contracted hours (falls back to legacy
+               project-level contracted_hours during migration).
+    Deducted = sum over all lines of (Students × Stu Hours) + PI Hours.
     """
-    budget = float(proj.get("contracted_hours", 0.0))
+    chf = proj.get("contracted_hours_by_fy") or {}
+    if chf:
+        budget = sum(float(v or 0) for v in chf.values())
+    else:
+        budget = float(proj.get("contracted_hours", 0.0))
     deducted = 0.0
     for r in proj.get("lines", []):
         try:
@@ -341,17 +359,16 @@ def project_hours_summary(proj: dict):
 
 # ─── Per-FY line items + budget (carry-over) ─────────────────────────────
 # Line items are stored per fiscal year:  proj["lines_by_fy"] = {"2026": [...]}
-# proj["lines"] is kept as the flattened view of every FY's lines so existing
-# whole-project totals keep working unchanged.
+# proj["lines"] is kept as the flattened view of every FY's lines.
 #
-# Budget is set per FY in proj["fy_funding"] = {"2026": {"added": 10000.0,
-# "hours_added": 100.0}, ...}.  For each FY:
-#     Available = Carried-in + Added
-#     Spent     = sum of that FY's line-item actual costs
-#     Remaining = Available - Spent   (this is what carries forward)
-# Carry-in is DERIVED from the prior FY's Remaining, but only once that prior
-# FY has ended (after May 31).  Nothing about carry-over is stored, so it is
-# always re-computable and never double-counts.
+# BUDGET for a FY = the contracted columns of that FY's line items
+#   (Cont. Personnel + PI + Indirect + Fringe + Travel).
+# SPENT for a FY  = that FY's actual costs (Personnel + PI + actual Travel).
+# Leftover (Available - Spent) carries into the next FY automatically once the
+# FY has ended (after May 31).  Carry-in is DERIVED, never stored, so the whole
+# ledger is always re-computable and never double-counts.
+#
+# Contracted HOURS are set per FY in proj["contracted_hours_by_fy"] = {"2026": 100}.
 
 def _fy_ended(year: int) -> bool:
     """True once fiscal year (Jun 1 of `year` → May 31 of year+1) is over."""
@@ -362,7 +379,7 @@ def _fy_ended(year: int) -> bool:
 
 
 def project_primary_fy(proj: dict) -> int:
-    """The FY a project 'belongs' to by default (used to migrate old lines)."""
+    """The FY a project 'belongs' to by default (used to migrate old data)."""
     for ds in (proj.get("start_date", ""), proj.get("end_date", ""),
                proj.get("extension_date", "")):
         d = parse_date(ds)
@@ -376,7 +393,6 @@ def lines_by_fy(proj: dict) -> dict:
 
 
 def flatten_lines(proj: dict) -> list:
-    """All line items across every FY, ascending by year."""
     lbf = proj.get("lines_by_fy") or {}
     out = []
     for y in sorted(lbf, key=lambda k: int(k)):
@@ -388,8 +404,31 @@ def fy_lines(proj: dict, year) -> list:
     return (proj.get("lines_by_fy") or {}).get(str(year), [])
 
 
+def _contracted_travel(r) -> float:
+    """Contracted travel = row[13], falling back to old row[8] if blank."""
+    try:
+        v = float(r[13])
+    except Exception:
+        v = 0.0
+    if v == 0.0:
+        try:
+            v = float(r[8])
+        except Exception:
+            v = 0.0
+    return v
+
+
+def fy_contracted_budget(proj: dict, year) -> float:
+    """Budget for one FY = contracted Personnel + PI + Indirect + Fringe + Travel."""
+    total = 0.0
+    for r in fy_lines(proj, year):
+        r = validate_line(r)
+        total += float(r[9]) + float(r[10]) + float(r[11]) + float(r[12]) + _contracted_travel(r)
+    return total
+
+
 def fy_actual_spend(proj: dict, year) -> float:
-    """Dollar spend for a FY: personnel + PI + actual travel from its lines."""
+    """Actual spend for a FY: personnel + PI + actual travel from its lines."""
     total = 0.0
     for r in fy_lines(proj, year):
         r = validate_line(r)
@@ -399,8 +438,12 @@ def fy_actual_spend(proj: dict, year) -> float:
     return total
 
 
+def fy_contracted_hours(proj: dict, year) -> float:
+    return float((proj.get("contracted_hours_by_fy") or {}).get(str(year), 0) or 0)
+
+
 def fy_hours_spend(proj: dict, year) -> float:
-    """Hours spend for a FY: (students × stu hrs) + PI hrs from its lines."""
+    """Hours deducted for a FY: (students × stu hrs) + PI hrs from its lines."""
     total = 0.0
     for r in fy_lines(proj, year):
         r = validate_line(r)
@@ -408,24 +451,26 @@ def fy_hours_spend(proj: dict, year) -> float:
     return total
 
 
-def fy_funding_rows(proj: dict) -> list:
-    """Derived per-FY rows in ascending year order.
+def _fy_year_set(proj: dict):
+    years = set(int(k) for k in (proj.get("lines_by_fy") or {}))
+    years |= set(int(k) for k in (proj.get("contracted_hours_by_fy") or {}))
+    return years
 
-    Each row: year, carried_in, added, available, spent, remaining
-    (+ the h_* hours equivalents).  Years come from both the budget ledger
-    and any FY that has line items, so spend always shows up.
+
+def fy_funding_rows(proj: dict) -> list:
+    """Derived per-FY rows, ascending by year.
+
+    Row keys: year, carried_in, added (= contracted budget), available, spent,
+    remaining, and the h_* hours equivalents.  Leftover (remaining) flows into
+    the next FY's carried_in once the FY has ended.
     """
-    ledger = proj.get("fy_funding", {}) or {}
-    years = set(int(k) for k in ledger)
-    years |= set(int(k) for k in (proj.get("lines_by_fy") or {}))
     rows = []
     prev_year = None
     prev_rem = 0.0
     prev_hrem = 0.0
-    for y in sorted(years):
-        e = ledger.get(str(y), {}) or {}
-        added = float(e.get("added") or 0)
-        hadded = float(e.get("hours_added") or 0)
+    for y in sorted(_fy_year_set(proj)):
+        added = fy_contracted_budget(proj, y)
+        hadded = fy_contracted_hours(proj, y)
         if prev_year is not None and _fy_ended(prev_year):
             cin, hcin = prev_rem, prev_hrem
         else:
@@ -446,8 +491,19 @@ def fy_funding_rows(proj: dict) -> list:
     return rows
 
 
+def fy_carry_in_for(proj: dict, year: int) -> tuple:
+    """($ carry-in, hours carry-in) for a FY, from the most recent earlier
+    year that has already ended."""
+    prior = [r for r in fy_funding_rows(proj) if r["year"] < int(year)]
+    if prior:
+        last = prior[-1]
+        if _fy_ended(last["year"]):
+            return last["remaining"], last["h_remaining"]
+    return 0.0, 0.0
+
+
 def fy_budget_available(proj: dict, year) -> float:
-    """Budget available for one FY = carried-in + added (what tables show)."""
+    """Budget available for one FY = carried-in + contracted budget."""
     for r in fy_funding_rows(proj):
         if r["year"] == int(year):
             return r["available"]
@@ -461,22 +517,18 @@ def fy_hours_available(proj: dict, year) -> float:
     return fy_carry_in_for(proj, int(year))[1]
 
 
+def fy_hours_summary(proj: dict, year) -> tuple:
+    """(available, spent, remaining) contracted hours for one FY."""
+    cin_h = fy_carry_in_for(proj, int(year))[1]
+    avail = cin_h + fy_contracted_hours(proj, year)
+    spent = fy_hours_spend(proj, year)
+    return avail, spent, avail - spent
+
+
 def fy_total_budget_added(proj: dict) -> float:
-    """Sum of NEW budget added across all FYs (for the 'All' filter — does
-    not double-count carried-over amounts)."""
-    return sum(float((e or {}).get("added") or 0)
-               for e in (proj.get("fy_funding", {}) or {}).values())
-
-
-def fy_carry_in_for(proj: dict, year: int) -> tuple:
-    """($ carry-in, hours carry-in) for a FY, from the most recent earlier
-    ledger/line year that has already ended."""
-    prior = [r for r in fy_funding_rows(proj) if r["year"] < int(year)]
-    if prior:
-        last = prior[-1]
-        if _fy_ended(last["year"]):
-            return last["remaining"], last["h_remaining"]
-    return 0.0, 0.0
+    """Total contracted budget across all FYs (for the 'All' filter); equals
+    the whole-project contracted total and does not double-count carry-over."""
+    return sum(fy_contracted_budget(proj, y) for y in _fy_year_set(proj))
 
 
 def count_tool_users(data: dict, tool_name: str) -> int:
