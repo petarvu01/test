@@ -408,14 +408,25 @@ elif page == "Project View":
                          key=f"proj_ext_{active}", format="YYYY-MM-DD")
     no_budget = dc4.checkbox("No Budget", value=proj.get("has_budget", False),
                              key=f"nb_chk_{active}")
-    if st.button("💾 Save Dates", key=f"save_dates_{active}"):
+    btn_c1, btn_c2, _ = st.columns([1, 1, 3])
+    if btn_c1.button("💾 Save Dates", key=f"save_dates_{active}"):
         proj["start_date"] = str(sd) if sd else ""
         proj["end_date"] = str(ed) if ed else ""
         proj["extension_date"] = str(ext) if ext else ""
         proj["has_budget"] = no_budget
+        st.session_state.pop(f"view_fy_{active}", None)
         save()
         st.toast("Dates saved")
         st.rerun()
+    if proj.get("extension_date"):
+        if btn_c2.button("🗑️ Clear Extension", key=f"clear_ext_{active}"):
+            proj["extension_date"] = ""
+            # reset the date widget so it shows empty again
+            st.session_state.pop(f"proj_ext_{active}", None)
+            st.session_state.pop(f"view_fy_{active}", None)
+            save()
+            st.toast("Extension date removed")
+            st.rerun()
 
     # ── Status (auto-Finished when past-dated; Renewed when extended) ─
     status_options = ["Active", "On Pause", "Finished"]
@@ -459,17 +470,19 @@ elif page == "Project View":
     vfy_this = fy_label(date_to_fy(date.today()))
     vfy_opts.append(vfy_this)
     vfy_opts.append(fy_label(project_primary_fy(proj)))
+    # Default: the project's START fiscal year — unless an extension date falls
+    # in a later FY, in which case open on the extension's FY.
+    start_d = parse_date(proj.get("start_date", ""))
+    start_fy = date_to_fy(start_d) if start_d else project_primary_fy(proj)
+    ext_d = parse_date(proj.get("extension_date", ""))
+    default_year = start_fy
+    if ext_d and date_to_fy(ext_d) > start_fy:
+        default_year = date_to_fy(ext_d)
+    # make sure the chosen year is selectable
+    if fy_label(default_year) not in vfy_opts:
+        vfy_opts.append(fy_label(default_year))
     vfy_opts = sorted(set(vfy_opts), key=lambda lab: int(lab.split()[1].split("-")[0]))
-    # Default to the current FY if it has data, else the most recent FY that does.
-    years_with_data = sorted(
-        set(int(k) for k in proj.get("lines_by_fy", {}))
-        | set(int(k) for k in proj.get("contracted_hours_by_fy", {}))
-    )
-    this_year = date_to_fy(date.today())
-    if this_year in years_with_data or not years_with_data:
-        default_lbl = vfy_this
-    else:
-        default_lbl = fy_label(years_with_data[-1])
+    default_lbl = fy_label(default_year)
     vfy_idx = vfy_opts.index(default_lbl) if default_lbl in vfy_opts else 0
     view_fy_label = st.selectbox(
         "View / edit fiscal year", vfy_opts, index=vfy_idx, key=f"view_fy_{active}",
