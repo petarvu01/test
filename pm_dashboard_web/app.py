@@ -460,7 +460,17 @@ elif page == "Project View":
     vfy_opts.append(vfy_this)
     vfy_opts.append(fy_label(project_primary_fy(proj)))
     vfy_opts = sorted(set(vfy_opts), key=lambda lab: int(lab.split()[1].split("-")[0]))
-    vfy_idx = vfy_opts.index(vfy_this) if vfy_this in vfy_opts else 0
+    # Default to the current FY if it has data, else the most recent FY that does.
+    years_with_data = sorted(
+        set(int(k) for k in proj.get("lines_by_fy", {}))
+        | set(int(k) for k in proj.get("contracted_hours_by_fy", {}))
+    )
+    this_year = date_to_fy(date.today())
+    if this_year in years_with_data or not years_with_data:
+        default_lbl = vfy_this
+    else:
+        default_lbl = fy_label(years_with_data[-1])
+    vfy_idx = vfy_opts.index(default_lbl) if default_lbl in vfy_opts else 0
     view_fy_label = st.selectbox(
         "View / edit fiscal year", vfy_opts, index=vfy_idx, key=f"view_fy_{active}",
         help="Budget, line items and hours below are for this fiscal year. "
@@ -521,7 +531,7 @@ elif page == "Project View":
         "Cont. Indirect": line_value(row, 11),
         "Cont. Fringe": line_value(row, 12),
         "Cont. Travel": contracted_travel_cost(row),
-    } for row in fy_rows_for_edit])
+    } for row in (fy_rows_for_edit or [blank_line()])])
 
     money = st.column_config.NumberColumn(min_value=0.0, step=1.0, format="$%.2f")
     hours = st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f")
