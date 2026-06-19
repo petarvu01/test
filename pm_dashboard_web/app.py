@@ -1507,6 +1507,22 @@ elif page == "Results":
     fy_a = c1.selectbox("Compare from (older FY)", choices, index=0, key="res_fy_a")
     fy_b = c2.selectbox("…to (newer FY)", choices,
                         index=len(choices) - 1, key="res_fy_b")
+    mode = st.radio("Comparison", ["All projects (total)", "Per project"],
+                    horizontal=True, key="res_mode")
+
+    fy_year_a = None if fy_a == "All" else int(fy_a.split()[1].split("-")[0])
+    fy_year_b = None if fy_b == "All" else int(fy_b.split()[1].split("-")[0])
+
+    def proj_budget(proj, fy_year):
+        if proj.get("has_budget", False):
+            return None
+        return fy_budget_available(proj, fy_year) if fy_year is not None \
+            else fy_total_budget_added(proj)
+
+    def proj_actuals(proj, fy_year):
+        scope = fy_lines(proj, fy_year) if fy_year is not None else proj["lines"]
+        return sum(actual_personnel_cost(r) + actual_pi_cost(r) + line_value(r, 8)
+                   for r in scope)
 
     def metrics_for(fy):
         proj_count = 0
@@ -1546,38 +1562,98 @@ elif page == "Results":
     st.caption(f"Comparing **{fy_a} → {fy_b}** "
                f"({'same year' if fy_a == fy_b else 'year over year'})")
 
-    # Headline cards (newer FY value, with growth % as the delta arrow)
-    cols = st.columns(4)
-    for col, metric in zip(cols, metric_order):
-        a, b = ma[metric], mb[metric]
-        g = growth(a, b)
-        col.metric(metric, fmt_val(metric, b),
-                   None if g is None else f"{g:+.1f}%")
+    if mode == "All projects (total)":
+        # Headline cards (newer FY value, with growth % as the delta arrow)
+        cols = st.columns(4)
+        for col, metric in zip(cols, metric_order):
+            a, b = ma[metric], mb[metric]
+            g = growth(a, b)
+            col.metric(metric, fmt_val(metric, b),
+                       None if g is None else f"{g:+.1f}%")
 
-    # Detailed table: both years, absolute change, and growth %
-    rows = []
-    for metric in metric_order:
-        a, b = ma[metric], mb[metric]
-        g = growth(a, b)
-        change = b - a
-        if metric == "Budget":
-            sign = "+" if change >= 0 else "−"
-            change_str = f"{sign}${abs(change):,.2f}"
+        # Detailed table: both years, absolute change, and growth %
+        rows = []
+        for metric in metric_order:
+            a, b = ma[metric], mb[metric]
+            g = growth(a, b)
+            change = b - a
+            if metric == "Budget":
+                sign = "+" if change >= 0 else "−"
+                change_str = f"{sign}${abs(change):,.2f}"
+            else:
+                change_str = f"{int(change):+,}"
+            rows.append({
+                "Metric": metric,
+                fy_a: fmt_val(metric, a),
+                fy_b: fmt_val(metric, b),
+                "Change": change_str,
+                "Growth %": "—" if g is None else f"{g:+.1f}%",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption("Growth % shows “—” when the older year is 0 (no baseline to divide by). "
+                   "Budget and project count are based on projects active in each FY; "
+                   "credits come from the Credits tab; student workers from the saved table for that FY.")
+
+        csv = pd.DataFrame(rows).to_csv(index=False)
+        st.download_button("⬇️ Download CSV", csv,
+                           f"results_{fy_a.replace(' ', '_')}_vs_{fy_b.replace(' ', '_')}.csv",
+                           "text/csv")
+
+    else:  # ── Per project ──────────────────────────────────────────────
+        names = sorted(
+            n for n, p in D()["project_records"].items()
+            if project_in_fy(p, fy_a) or project_in_fy(p, fy_b)
+        )
+        if not names:
+            st.info("No projects fall within either of the selected fiscal years.")
         else:
-            change_str = f"{int(change):+,}"
-        rows.append({
-            "Metric": metric,
-            fy_a: fmt_val(metric, a),
-            fy_b: fmt_val(metric, b),
-            "Change": change_str,
-            "Growth %": "—" if g is None else f"{g:+.1f}%",
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    st.caption("Growth % shows “—” when the older year is 0 (no baseline to divide by). "
-               "Budget and project count are based on projects active in each FY; "
-               "credits come from the Credits tab; student workers from the saved table for that FY.")
+            tot_ba = tot_bb = tot_aa = tot_ab = 0.0
+            rows = []
+            for name in names:
+                p = D()["project_records"][name]
+                in_a = project_in_fy(p, fy_a)
+                in_b = project_in_fy(p, fy_b)
+                ba = proj_budget(p, fy_year_a) if in_a else None
+                bb = proj_budget(p, fy_year_b) if in_b else None
+                aa = proj_actuals(p, fy_year_a) if in_a else None
+                ab = proj_actuals(p, fy_year_b) if in_b else None
+                if ba is not None:
+                    tot_ba += ba
+                if bb is not None:
+                    tot_bb += bb
+                if aa is not None:
+                    tot_aa += aa
+                if ab is not None:
+                    tot_ab += ab
+                bgr = growth(ba or 0, bb or 0) if (ba is not None and bb is not None) else None
 
-    csv = pd.DataFrame(rows).to_csv(index=False)
-    st.download_button("⬇️ Download CSV", csv,
-                       f"results_{fy_a.replace(' ', '_')}_vs_{fy_b.replace(' ', '_')}.csv",
-                       "text/csv")
+                def money(v):
+                    return "—" if v is None else f"${v:,.2f}"
+                rows.append({
+                    "Project": name,
+                    f"Budget {fy_a}": money(ba),
+                    f"Budget {fy_b}": money(bb),
+                    "Budget Growth %": "—" if bgr is None else f"{bgr:+.1f}%",
+                    f"Actuals {fy_a}": money(aa),
+                    f"Actuals {fy_b}": money(ab),
+                })
+            # Totals row
+            tgr = growth(tot_ba, tot_bb)
+            rows.append({
+                "Project": "— TOTAL —",
+                f"Budget {fy_a}": f"${tot_ba:,.2f}",
+                f"Budget {fy_b}": f"${tot_bb:,.2f}",
+                "Budget Growth %": "—" if tgr is None else f"{tgr:+.1f}%",
+                f"Actuals {fy_a}": f"${tot_aa:,.2f}",
+                f"Actuals {fy_b}": f"${tot_ab:,.2f}",
+            })
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.caption("One row per project that falls within either fiscal year. A column "
+                       "shows “—” when the project isn't active in that FY. Budget is that "
+                       "FY's available budget (carried-in + contracted); Actuals is that "
+                       "FY's line-item spend. “No Budget” projects show — for budget.")
+            csv = df.to_csv(index=False)
+            st.download_button("⬇️ Download CSV", csv,
+                               f"results_per_project_{fy_a.replace(' ', '_')}_vs_{fy_b.replace(' ', '_')}.csv",
+                               "text/csv")
