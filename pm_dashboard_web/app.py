@@ -11,7 +11,9 @@ from data import (load_data, save_data, blank_project, blank_line,
                   wo_project_total, flat_invoice_rows, get_all_notifications,
                   get_fy_options, project_in_fy, project_hours_summary,
                   count_tool_users, tool_share_costs, gist_configured,
-                  fy_funding_rows, fy_carry_in_for,
+                  fy_funding_rows, fy_carry_in_for, fy_budget_available,
+                  fy_hours_available, fy_total_budget_added, fy_actual_spend,
+                  fy_hours_spend, fy_lines, flatten_lines, project_primary_fy,
                   tool_users, tool_split_for, tool_split_amounts,
                   tool_has_custom_split, tool_split_status,
                   compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS)
@@ -472,20 +474,20 @@ elif page == "Project View":
         st.caption("No contracted hours set — hours-deduction tracking is off for this "
                    "project. Set a value above to turn it on.")
 
-    # ── FY Funding (per-fiscal-year running balance, with carry-over) ──
+    # ── FY Budget (per fiscal year, with automatic carry-over) ────────
     st.markdown("---")
-    st.subheader("💵 FY Funding (carry-over budget & hours)")
+    st.subheader("💵 FY Budget (carry-over)")
     st.caption(
-        "A per-fiscal-year running balance for **budget ($) and hours**, separate "
-        "from the line-item budget — this does **not** affect the Master table or "
-        "Budget vs Actual. Enter what was **Added** each FY and the current "
-        "**Remaining**; unused balance rolls into the next FY's *Carried in* "
-        "automatically once that year ends (after May 31)."
+        "Set the **budget added** for each fiscal year. **Spent** is computed "
+        "from that year's line items below. Whatever is left (Available − Spent) "
+        "**carries into the next FY automatically** once the year ends (after "
+        "May 31). These figures drive the Budget column in **Master** and "
+        "**Budget vs Actual** when you filter by fiscal year."
     )
 
     fy_ledger = proj.setdefault("fy_funding", {})
 
-    # Existing ledger as a derived summary table (read-only).
+    # Per-FY summary (budget, computed spend, remaining, carry-over).
     fy_rows = fy_funding_rows(proj)
     if fy_rows:
         summary = [{
@@ -493,40 +495,35 @@ elif page == "Project View":
             "Carried in $": f"${r['carried_in']:,.2f}",
             "Added $": f"${r['added']:,.2f}",
             "Available $": f"${r['available']:,.2f}",
-            "Remaining $": f"${r['remaining']:,.2f}",
             "Spent $": f"${r['spent']:,.2f}",
-            "Hrs Carried": f"{r['h_carried_in']:,.1f}",
-            "Hrs Added": f"{r['h_added']:,.1f}",
+            "Remaining $": f"${r['remaining']:,.2f}",
             "Hrs Avail": f"{r['h_available']:,.1f}",
+            "Hrs Spent": f"{r['h_spent']:,.1f}",
             "Hrs Remaining": f"{r['h_remaining']:,.1f}",
         } for r in fy_rows]
         st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
     else:
-        st.caption("No FY funding recorded yet. Pick a fiscal year below to start.")
+        st.caption("No FY budget recorded yet. Pick a fiscal year below to start.")
 
-    # Editor for one FY.
-    fy_opts = get_fy_options(D())
-    fy_opts = [o for o in fy_opts if o != "All"]
-    this_fy = fy_label(date_to_fy(date.today()))
-    if this_fy not in fy_opts:
-        fy_opts.append(this_fy)
-    fy_opts = sorted(set(fy_opts))
-    default_idx = fy_opts.index(this_fy) if this_fy in fy_opts else 0
+    # Budget editor for one FY.
+    fb_opts = [o for o in get_fy_options(D()) if o != "All"]
+    fb_this = fy_label(date_to_fy(date.today()))
+    for k in list(fy_ledger.keys()) + list(proj.get("lines_by_fy", {}).keys()):
+        fb_opts.append(fy_label(int(k)))
+    fb_opts.append(fb_this)
+    fb_opts = sorted(set(fb_opts), key=lambda lab: int(lab.split()[1].split("-")[0]))
+    fb_idx = fb_opts.index(fb_this) if fb_this in fb_opts else 0
 
-    sel_label = st.selectbox("Edit fiscal year", fy_opts, index=default_idx,
+    sel_label = st.selectbox("Edit fiscal year budget", fb_opts, index=fb_idx,
                              key=f"fy_fund_pick_{active}")
     sel_year = int(sel_label.split()[1].split("-")[0])
     sel_key = str(sel_year)
     entry = fy_ledger.get(sel_key, {})
 
-    # Derived carry-in for the selected year (from the prior ended FY).
-    cin_dollars, cin_hours = fy_carry_in_for(proj, sel_year)
+    cin_d, cin_h = fy_carry_in_for(proj, sel_year)
+    spent_d = fy_actual_spend(proj, sel_year)
+    spent_h = fy_hours_spend(proj, sel_year)
     ended = date.today() > date(sel_year + 1, 5, 31)
-
-    fcc1, fcc2, fcc3 = st.columns(3)
-    fcc1.metric("Carried in $", f"${cin_dollars:,.2f}")
-    fcc2.metric("Carried in hrs", f"{cin_hours:,.1f}")
-    fcc3.metric("FY status", "Ended" if ended else "In progress")
 
     ec1, ec2 = st.columns(2)
     with ec1:
@@ -534,52 +531,63 @@ elif page == "Project View":
             f"Budget added in {sel_label} ($)",
             value=float(entry.get("added") or 0.0), min_value=0.0, step=100.0,
             format="%.2f", key=f"fy_add_d_{active}_{sel_key}")
-        rem_default_d = cin_dollars + add_d
-        stored_rem_d = entry.get("remaining")
-        rem_d = st.number_input(
-            "Remaining $ (what's left now)",
-            value=float(rem_default_d if stored_rem_d is None else stored_rem_d),
-            min_value=0.0, step=100.0, format="%.2f",
-            key=f"fy_rem_d_{active}_{sel_key}")
     with ec2:
         add_h = st.number_input(
             f"Hours added in {sel_label}",
             value=float(entry.get("hours_added") or 0.0), min_value=0.0, step=1.0,
             format="%.1f", key=f"fy_add_h_{active}_{sel_key}")
-        rem_default_h = cin_hours + add_h
-        stored_rem_h = entry.get("hours_remaining")
-        rem_h = st.number_input(
-            "Remaining hours (what's left now)",
-            value=float(rem_default_h if stored_rem_h is None else stored_rem_h),
-            min_value=0.0, step=1.0, format="%.1f",
-            key=f"fy_rem_h_{active}_{sel_key}")
 
-    avail_d = cin_dollars + add_d
-    avail_h = cin_hours + add_h
+    avail_d = cin_d + add_d
+    avail_h = cin_h + add_h
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Carried in $", f"${cin_d:,.0f}")
+    m2.metric("Available $", f"${avail_d:,.0f}")
+    m3.metric("Spent $ (line items)", f"${spent_d:,.0f}")
+    m4.metric("Remaining $", f"${avail_d - spent_d:,.0f}")
     st.caption(
-        f"Available this FY: **${avail_d:,.2f}** / **{avail_h:,.1f} hrs** "
-        f"(Carried in + Added). Spent so far: ${avail_d - rem_d:,.2f} / "
-        f"{avail_h - rem_h:,.1f} hrs."
+        f"Hours — Carried in: {cin_h:,.1f} · Available: {avail_h:,.1f} · "
+        f"Spent: {spent_h:,.1f} · Remaining: {avail_h - spent_h:,.1f}. "
+        f"FY status: {'Ended — leftover has carried forward' if ended else 'In progress'}."
     )
-    if rem_d > avail_d + 0.005 or rem_h > avail_h + 0.005:
-        st.warning("Remaining is larger than Available — double-check the numbers.")
+    if spent_d > avail_d + 0.005:
+        st.warning(f"{sel_label} is over budget by ${spent_d - avail_d:,.2f}.")
 
-    if st.button("💾 Save FY Funding", key=f"fy_save_{active}_{sel_key}"):
+    if st.button("💾 Save FY Budget", key=f"fy_save_{active}_{sel_key}"):
         fy_ledger[sel_key] = {
             "added": float(add_d),
-            "remaining": float(rem_d),
             "hours_added": float(add_h),
-            "hours_remaining": float(rem_h),
         }
         save()
-        st.toast(f"{sel_label} funding saved")
+        st.toast(f"{sel_label} budget saved")
         st.rerun()
+
 
     # ── Line items (editable grid) ─────────────────────────────────────
     st.subheader("Line Items")
-    grid_caption = ("Edit any cell directly. Use the **＋** at the bottom of the grid to add a "
-                    "line, or tick a row's checkbox and press your keyboard Delete to remove it — "
-                    "then click Save Line Items.")
+
+    # Which fiscal year do these line items count against?
+    lbf = proj.setdefault("lines_by_fy", {})
+    li_opts = [o for o in get_fy_options(D()) if o != "All"]
+    li_this_fy = fy_label(date_to_fy(date.today()))
+    for k in lbf.keys():
+        li_opts.append(fy_label(int(k)))
+    li_opts.append(li_this_fy)
+    li_opts.append(fy_label(project_primary_fy(proj)))
+    li_opts = sorted(set(li_opts), key=lambda lab: int(lab.split()[1].split("-")[0]))
+    li_default = li_this_fy if li_this_fy in li_opts else li_opts[0]
+    li_sel = st.selectbox(
+        "Fiscal year these line items deduct from", li_opts,
+        index=li_opts.index(li_default), key=f"li_fy_{active}",
+        help="Costs entered below count against this fiscal year's budget. "
+             "Switch years to edit a different year's costs.",
+    )
+    li_year = int(li_sel.split()[1].split("-")[0])
+    li_key = str(li_year)
+    fy_rows_for_edit = lbf.get(li_key, [])
+
+    grid_caption = (f"Editing **{li_sel}** costs. Edit any cell directly. Use the **＋** at the "
+                    "bottom of the grid to add a line, or tick a row's checkbox and press "
+                    "Delete to remove it — then click Save Line Items.")
     if tracks_hours:
         grid_caption += (" Hours deducted from the Contracted Hours budget are computed "
                          "automatically: **(Students × Stu Hours) + PI Hours** per line.")
@@ -598,13 +606,13 @@ elif page == "Project View":
         "Cont. Indirect": line_value(row, 11),
         "Cont. Fringe": line_value(row, 12),
         "Cont. Travel": contracted_travel_cost(row),
-    } for row in proj["lines"]])
+    } for row in fy_rows_for_edit])
 
     money = st.column_config.NumberColumn(min_value=0.0, step=1.0, format="$%.2f")
     hours = st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f")
     edited = st.data_editor(
         edit_df, use_container_width=True, hide_index=True,
-        num_rows="dynamic", key=f"lines_editor_{active}",
+        num_rows="dynamic", key=f"lines_editor_{active}_{li_key}",
         column_config={
             "Line Item": st.column_config.TextColumn(required=True, width="medium"),
             "Students": st.column_config.NumberColumn(min_value=0, step=1),
@@ -615,7 +623,7 @@ elif page == "Project View":
         },
     )
 
-    if st.button("💾 Save Line Items"):
+    if st.button("💾 Save Line Items", key=f"save_lines_{active}_{li_key}"):
         new_lines = [[
             (r["Line Item"] or "Untitled"),
             num(r["Students"], int), num(r["Stu Rate"]), num(r["Stu Hours"]),
@@ -624,14 +632,15 @@ elif page == "Project View":
             num(r["Cont. Personnel"]), num(r["Cont. PI"]),
             num(r["Cont. Indirect"]), num(r["Cont. Fringe"]), num(r["Cont. Travel"]),
         ] for _, r in edited.iterrows()]
-        proj["lines"] = new_lines or [blank_line()]
+        lbf[li_key] = new_lines or [blank_line()]
+        proj["lines"] = flatten_lines(proj) or [blank_line()]
         save()
-        st.toast("Line items saved")
+        st.toast(f"{li_sel} line items saved")
         st.rerun()
 
-    # Read-only computed recap (reflects the last saved state)
+    # Read-only computed recap (reflects the last saved state of THIS FY)
     recap = []
-    for row in proj["lines"]:
+    for row in lbf.get(li_key, []):
         s, sr, sh = int(line_value(row, 1)), line_value(row, 2), line_value(row, 3)
         pr2, ph = line_value(row, 4), line_value(row, 5)
         cont = (line_value(row, 9) + line_value(row, 10) + line_value(row, 11)
@@ -782,14 +791,29 @@ elif page == "Master View":
     rows = []
     gt_b = gt_s = gt_p = 0.0; gt_c = 0
     gt_ch = 0.0
+    # Selected fiscal year (None = "All")
+    sel_year = None
+    if fy != "All":
+        try:
+            sel_year = int(fy.split()[1].split("-")[0])
+        except Exception:
+            sel_year = None
+    st.caption(
+        f"Budget shown is the **{fy}** FY budget (carried-in + added)."
+        if sel_year is not None else
+        "Budget shown is total new budget added across all fiscal years. "
+        "Pick a fiscal year to see that year's budget and spend."
+    )
     for name, proj in filtered_projects(search, fy):
         is_red = proj.get("has_budget", False)
-        budget = stu = pi = 0.0
-        for row in proj["lines"]:
-            # Contracted budget = contracted personnel + contracted PI + contracted indirect + contracted fringe + contracted travel
-            budget += line_value(row, 9) + line_value(row, 10) + line_value(row, 11) + line_value(row, 12) + contracted_travel_cost(row)
-            stu += actual_personnel_cost(row)
-            pi += actual_pi_cost(row)
+        if sel_year is not None:
+            budget = fy_budget_available(proj, sel_year)
+            scope_lines = fy_lines(proj, sel_year)
+        else:
+            budget = fy_total_budget_added(proj)
+            scope_lines = proj["lines"]
+        stu = sum(actual_personnel_cost(row) for row in scope_lines)
+        pi = sum(actual_pi_cost(row) for row in scope_lines)
         ch_budget, _ = project_hours_summary(proj)
         credits = sum(s["credits"] for s in D()["student_credits"] if s["project"] == name)
         ext = proj.get("extension_date", "")
@@ -834,37 +858,41 @@ elif page == "Actual vs Budget":
     fy = fc2.selectbox("Fiscal Year", get_fy_options(D()), key="avb_fy")
 
     rows = []
+    sel_year = None
+    if fy != "All":
+        try:
+            sel_year = int(fy.split()[1].split("-")[0])
+        except Exception:
+            sel_year = None
+    st.caption(
+        f"Budget = the **{fy}** budget (carried-in + added). Actuals = that year's "
+        "line-item spend (personnel + PI + actual travel). Tool costs are tracked "
+        "separately in Tools and aren't part of this per-FY comparison."
+        if sel_year is not None else
+        "Showing all fiscal years combined: Budget = total budget added, Actuals = "
+        "all line-item spend. Pick a fiscal year to compare a single year."
+    )
     for name, proj in filtered_projects(search, fy):
         is_red = proj.get("has_budget", False)
 
-        # Budget / contracted categories
-        cont_personnel = cont_pi = cont_indirect = cont_fringe = cont_travel = 0.0
+        if sel_year is not None:
+            budget = fy_budget_available(proj, sel_year)
+            carried_in_d = fy_carry_in_for(proj, sel_year)[0]
+            added_d = float((proj.get("fy_funding", {}).get(str(sel_year), {}) or {}).get("added") or 0)
+            scope_lines = fy_lines(proj, sel_year)
+        else:
+            budget = fy_total_budget_added(proj)
+            carried_in_d = 0.0
+            added_d = budget
+            scope_lines = proj["lines"]
 
-        # Actual / running cost categories
-        pers = pi = trv = tools_actual = 0.0
-
-        for row in proj["lines"]:
-            # Contracted budget = contracted personnel + contracted PI + contracted indirect + contracted fringe + contracted travel
-            cont_personnel += line_value(row, 9)
-            cont_pi += line_value(row, 10)
-            cont_indirect += line_value(row, 11)
-            cont_fringe += line_value(row, 12)
-            cont_travel += contracted_travel_cost(row)
-
-            # Actual cost = personnel + PI + actual travel + tools.
-            # Indirect and fringe are NOT included in actual/running cost.
+        pers = pi = trv = 0.0
+        for row in scope_lines:
             pers += actual_personnel_cost(row)
             pi += actual_pi_cost(row)
             trv += line_value(row, 8)
 
-        for tn in proj.get("assigned_tools", []):
-            t = next((x for x in D()["tools"] if x.get("name") == tn), None)
-            if t:
-                _, annual_share = tool_share_costs(D(), t, name)
-                tools_actual += annual_share
-
-        budget = cont_personnel + cont_pi + cont_indirect + cont_fringe + cont_travel
-        actuals = pers + pi + trv + tools_actual
+        actuals = pers + pi + trv
         if is_red:
             bstr, var_s, pct_s = "—", f"(${actuals:,.2f})", "—"
         else:
@@ -884,15 +912,11 @@ elif page == "Actual vs Budget":
             "Cont. Hours": f"{ch_budget:.0f}" if ch_budget > 0 else "—",
             "Actuals": f"${actuals:,.2f}",
             "Variance": var_s, "% Used": pct_s,
-            "_budget_personnel": cont_personnel,
-            "_budget_pi": cont_pi,
-            "_budget_indirect": cont_indirect,
-            "_budget_fringe": cont_fringe,
-            "_budget_travel": cont_travel,
+            "_budget_carried": carried_in_d,
+            "_budget_added": added_d,
             "_actual_personnel": pers,
             "_actual_pi": pi,
             "_actual_travel": trv,
-            "_actual_tools": tools_actual,
         })
 
     if rows:
@@ -905,17 +929,13 @@ elif page == "Actual vs Budget":
         for r in rows:
             with st.expander(f"{r['Project']} — {r['Budget']}"):
                 bdf = pd.DataFrame([
-                    {"Category": "Contracted Personnel", "Amount": f"${r['_budget_personnel']:,.2f}"},
-                    {"Category": "Contracted PI", "Amount": f"${r['_budget_pi']:,.2f}"},
-                    {"Category": "Contracted Indirect", "Amount": f"${r['_budget_indirect']:,.2f}"},
-                    {"Category": "Contracted Fringe", "Amount": f"${r['_budget_fringe']:,.2f}"},
-                    {"Category": "Contracted Travel", "Amount": f"${r['_budget_travel']:,.2f}"},
+                    {"Category": "Carried in (from prior FY)", "Amount": f"${r['_budget_carried']:,.2f}"},
+                    {"Category": "Added this FY", "Amount": f"${r['_budget_added']:,.2f}"},
                 ])
                 adf = pd.DataFrame([
                     {"Category": "Actual Personnel", "Amount": f"${r['_actual_personnel']:,.2f}"},
                     {"Category": "Actual PI", "Amount": f"${r['_actual_pi']:,.2f}"},
                     {"Category": "Actual Travel", "Amount": f"${r['_actual_travel']:,.2f}"},
-                    {"Category": "Actual Tools", "Amount": f"${r['_actual_tools']:,.2f}"},
                 ])
                 c1, c2 = st.columns(2)
                 with c1:
@@ -1513,14 +1533,20 @@ elif page == "Results":
         proj_count = 0
         budget = 0.0
         credits = 0
+        fy_year = None
+        if fy != "All":
+            try:
+                fy_year = int(fy.split()[1].split("-")[0])
+            except Exception:
+                fy_year = None
         for name, proj in filtered_projects("", fy):
             proj_count += 1
             # has_budget == True means a "No Budget" project, so it's excluded from budget totals
             if not proj.get("has_budget", False):
-                for row in proj["lines"]:
-                    budget += (line_value(row, 9) + line_value(row, 10)
-                               + line_value(row, 11) + line_value(row, 12)
-                               + contracted_travel_cost(row))
+                if fy_year is not None:
+                    budget += fy_budget_available(proj, fy_year)
+                else:
+                    budget += fy_total_budget_added(proj)
             credits += sum(s["credits"] for s in D()["student_credits"]
                            if s["project"] == name)
         sw_rec = D().get("student_workers", {}).get(fy)
