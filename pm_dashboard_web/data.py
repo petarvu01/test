@@ -471,7 +471,10 @@ def fy_funding_rows(proj: dict) -> list:
     for y in sorted(_fy_year_set(proj)):
         added = fy_contracted_budget(proj, y)
         hadded = fy_contracted_hours(proj, y)
-        if prev_year is not None and _fy_ended(prev_year):
+        # Running balance: leftover from the previous year always carries into
+        # this one (so the next FY shows the carry-in immediately, not only
+        # after the prior year ends on May 31).
+        if prev_year is not None:
             cin, hcin = prev_rem, prev_hrem
         else:
             cin, hcin = 0.0, 0.0
@@ -492,13 +495,17 @@ def fy_funding_rows(proj: dict) -> list:
 
 
 def fy_carry_in_for(proj: dict, year: int) -> tuple:
-    """($ carry-in, hours carry-in) for a FY, from the most recent earlier
-    year that has already ended."""
-    prior = [r for r in fy_funding_rows(proj) if r["year"] < int(year)]
+    """($ carry-in, hours carry-in) for a FY. If the year already exists in the
+    ledger its computed carry-in is authoritative; otherwise carry the leftover
+    of the most recent earlier year that has data (running balance)."""
+    rows = fy_funding_rows(proj)
+    for r in rows:
+        if r["year"] == int(year):
+            return r["carried_in"], r["h_carried_in"]
+    prior = [r for r in rows if r["year"] < int(year)]
     if prior:
         last = prior[-1]
-        if _fy_ended(last["year"]):
-            return last["remaining"], last["h_remaining"]
+        return last["remaining"], last["h_remaining"]
     return 0.0, 0.0
 
 
