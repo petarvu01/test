@@ -67,6 +67,17 @@ def blank_project(code, name, has_budget=False):
     }
 
 
+def _coerce(v, cast=float):
+    """Best-effort numeric coercion; never raises (0 on failure)."""
+    try:
+        return cast(v)
+    except (TypeError, ValueError):
+        try:
+            return cast(float(v))
+        except (TypeError, ValueError):
+            return cast(0)
+
+
 def validate_line(line):
     if not isinstance(line, list):
         return blank_line()
@@ -78,10 +89,16 @@ def validate_line(line):
             line.append(0.0)
     while len(line) < 14:
         line.append(0.0)
+    line = line[:14]
+    # Coerce field types so downstream math never crashes on stray/blank text.
+    line[0] = "" if line[0] is None else str(line[0])
+    line[1] = _coerce(line[1], int)
+    for i in (2, 3, 4, 5, 8, 9, 10, 11, 12, 13):
+        line[i] = _coerce(line[i], float)
     # Legacy actual indirect/fringe are no longer used.
     line[6] = 0.0
     line[7] = 0.0
-    return line[:14]
+    return line
 
 
 def default_data():
@@ -192,6 +209,19 @@ def _write_local(data: dict):
 
 def _normalize(data: dict) -> dict:
     """Apply field defaults and per-line migrations to a loaded data dict."""
+    # Re-key student-worker tables to the canonical FY label, so older keys
+    # (e.g. "FY 2025-26") adopt the current label format automatically and
+    # idempotently. The year is parsed from the 2nd token, which is unchanged.
+    sw = data.get("student_workers")
+    if isinstance(sw, dict) and sw:
+        fixed = {}
+        for label, rec in sw.items():
+            try:
+                y = int(str(label).split()[1].split("-")[0])
+                fixed[fy_label(y)] = rec
+            except Exception:
+                fixed[label] = rec
+        data["student_workers"] = fixed
     pr = data.get("project_records", {})
     for proj in pr.values():
         for key, default in [("notes",""), ("start_date",""), ("end_date",""),
@@ -848,9 +878,13 @@ def compute_kpis(data: dict) -> dict:
                 _, a = tool_share_costs(data, t, name)
                 actuals += a
 
-    cont_hours = sum(float(p.get("contracted_hours", 0) or 0) for p in pr.values())
-    hours_deducted = sum(project_hours_summary(p)[1] for p in pr.values()
-                         if float(p.get("contracted_hours", 0) or 0) > 0)
+    cont_hours = 0.0
+    hours_deducted = 0.0
+    for p in pr.values():
+        b, ded = project_hours_summary(p)
+        cont_hours += b
+        if b > 0:
+            hours_deducted += ded
 
     rows = flat_invoice_rows(data)
     unpaid = [r for r in rows if not r["paid"]]

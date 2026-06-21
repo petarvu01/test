@@ -16,7 +16,8 @@ def fmt_date(s: str) -> str:
 
 
 def fy_label(year: int) -> str:
-    return f"FY {year}-{str(year + 1)[2:]}"
+    end2 = str(year + 1)[2:]
+    return f"FY {year}-{end2} (FY{end2})"
 
 
 def date_to_fy(d: date) -> int:
