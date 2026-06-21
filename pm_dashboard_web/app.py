@@ -338,9 +338,18 @@ elif page == "Project View":
     pr = D()["project_records"]
     projects = projects_sorted()
 
+    # If a project was just created, land on it (must be set BEFORE the
+    # selectbox is built so the widget picks it up).
+    _new = st.session_state.pop("_new_project_name", None)
+    if _new and _new in projects:
+        st.session_state["proj_select"] = _new
+    # Drop a stale selection (e.g. after a delete) so the box doesn't error.
+    if st.session_state.get("proj_select") not in projects:
+        st.session_state.pop("proj_select", None)
+
     col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
-        active = st.selectbox("Active Project", projects)
+        active = st.selectbox("Active Project", projects, key="proj_select")
     with col2:
         if st.button("➕ Add Project"):
             st.session_state.show_add_project = True
@@ -385,6 +394,7 @@ elif page == "Project View":
                         pr[new_name] = p
                         save()
                         st.session_state.show_add_project = False
+                        st.session_state["_new_project_name"] = new_name
                         st.toast(f"Created {new_name}")
                         st.rerun()
                     else:
@@ -492,9 +502,12 @@ elif page == "Project View":
     view_year = int(view_fy_label.split()[1].split("-")[0])
     view_key = str(view_year)
 
-    # Per-FY budget summary (derived; carries over automatically at FY end)
+    # Per-FY budget summary (derived; carries over automatically at FY end).
+    # Carried-in is masked for fiscal years the project isn't running in, so an
+    # ended project doesn't appear to have a balance in a future FY.
+    project_running = project_in_fy(proj, view_fy_label)
     if not proj.get("has_budget", False):
-        cin_d, _cin_h = fy_carry_in_for(proj, view_year)
+        cin_d = fy_carry_in_for(proj, view_year)[0] if project_running else 0.0
         contr_d = fy_contracted_budget(proj, view_year)
         spent_d = fy_actual_spend(proj, view_year)
         avail_d = cin_d + contr_d
@@ -503,11 +516,19 @@ elif page == "Project View":
         bm2.metric("Contracted $ (budget)", f"${contr_d:,.0f}")
         bm3.metric("Spent $ (actual)", f"${spent_d:,.0f}")
         bm4.metric("Remaining $", f"${avail_d - spent_d:,.0f}")
-        st.caption(
-            f"Available this FY = carried-in + contracted = ${avail_d:,.0f}. "
-            f"Leftover (${avail_d - spent_d:,.0f}) carries into "
-            f"{fy_label(view_year + 1)} automatically after May 31."
-        )
+        if project_running:
+            st.caption(
+                f"Available this FY = carried-in + contracted = ${avail_d:,.0f}. "
+                f"Leftover (${avail_d - spent_d:,.0f}) carries into "
+                f"{fy_label(view_year + 1)} automatically after May 31."
+            )
+        else:
+            st.caption(
+                f"ℹ️ This project isn't running in {view_fy_label}, so any carried-over "
+                "balance is hidden here. Carry-over shows only in fiscal years the project "
+                "is active. Add an extension date that reaches into this FY to carry the "
+                "balance forward."
+            )
 
 
     # ── Line items (editable grid) ─────────────────────────────────────
@@ -519,7 +540,12 @@ elif page == "Project View":
     li_year = view_year
     li_key = view_key
     fy_rows_for_edit = lbf.get(li_key, [])
-    fy_h_avail, fy_h_spent, fy_h_remaining = fy_hours_summary(proj, view_year)
+    # Masked hours view: carried-in hours are hidden when the project isn't
+    # running in this FY (consistent with the budget summary above).
+    _h_cin = fy_carry_in_for(proj, view_year)[1] if project_running else 0.0
+    fy_h_avail = _h_cin + fy_contracted_hours(proj, view_year)
+    fy_h_spent = fy_hours_spend(proj, view_year)
+    fy_h_remaining = fy_h_avail - fy_h_spent
     tracks_hours = fy_h_avail > 0
 
     grid_caption = (f"Editing **{li_sel}** costs (change the Fiscal Year filter above to edit "
@@ -608,7 +634,7 @@ elif page == "Project View":
     st.subheader(f"Contracted Hours — {view_fy_label}")
     chf = proj.setdefault("contracted_hours_by_fy", {})
     cur_ch = float(chf.get(view_key, 0) or 0)
-    cin_h = fy_carry_in_for(proj, view_year)[1]
+    cin_h = fy_carry_in_for(proj, view_year)[1] if project_running else 0.0
     hc1, hc2 = st.columns([2, 2])
     with hc1:
         new_ch = st.number_input(
@@ -630,7 +656,7 @@ elif page == "Project View":
         st.toast("Contracted Hours saved")
         st.rerun()
 
-    avail_h, spent_h, remaining_h = fy_hours_summary(proj, view_year)
+    avail_h, spent_h, remaining_h = fy_h_avail, fy_h_spent, fy_h_remaining
     if avail_h > 0:
         pct = (spent_h / avail_h * 100) if avail_h > 0 else 0
         h1, h2, h3, h4 = st.columns(4)
