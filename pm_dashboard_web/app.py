@@ -1034,9 +1034,12 @@ elif page == "Student Workers":
     fy = st.selectbox("Fiscal Year for this table", fy_choices(), key="sw_fy")
 
     st.subheader("Load from Excel")
+    # The uploader key carries a per-FY nonce so we can fully reset it (clear the
+    # preview) after a save. Changing FY also changes the key → fresh empty box.
+    nonce = st.session_state.get(f"sw_nonce_{fy}", 0)
     up = st.file_uploader(
-        f"Drag an Excel file here to load the {fy} student worker list",
-        type=["xlsx", "xls"], key=f"sw_upload_{fy}",
+        f"Drag an Excel (.xlsx) file here to load the {fy} student worker list",
+        type=["xlsx"], key=f"sw_upload_{fy}_{nonce}",
     )
     if up is not None:
         try:
@@ -1046,6 +1049,8 @@ elif page == "Student Workers":
             if st.button(f"💾 Save to {fy}", type="primary", key=f"sw_save_{fy}"):
                 sw[fy] = df_to_store(df_new)
                 save()
+                # Bump the nonce so the uploader resets and the preview disappears.
+                st.session_state[f"sw_nonce_{fy}"] = nonce + 1
                 st.toast(f"Saved {len(df_new)} student workers to {fy}")
                 st.rerun()
         except Exception as e:
