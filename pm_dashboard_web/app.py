@@ -97,6 +97,28 @@ def fy_choices():
     return [fy_label(y) for y in sorted(years)]
 
 
+def _fy_year_of(label):
+    """Parse the fiscal-year start-year integer out of any FY label."""
+    try:
+        return int(str(label).split()[1].split("-")[0])
+    except Exception:
+        return None
+
+
+def sw_count_for_fy(fy):
+    """Count of student-worker rows saved for a fiscal year, matched by YEAR so
+    it works regardless of label format ('FY 2025-26' vs 'FY 2025-26 (FY26)').
+    This is the roster row count (header is stored separately, not counted)."""
+    sw = D().get("student_workers", {})
+    if fy == "All":
+        return sum(len((r or {}).get("data", [])) for r in sw.values())
+    target = _fy_year_of(fy)
+    for key, rec in sw.items():
+        if _fy_year_of(key) == target:
+            return len((rec or {}).get("data", []))
+    return 0
+
+
 def read_excel(file):
     """Read an uploaded Excel file into a DataFrame, with date columns as strings."""
     df = pd.read_excel(file)
@@ -1593,8 +1615,7 @@ elif page == "Results":
                     budget += fy_total_budget_added(proj)
             credits += sum(s["credits"] for s in D()["student_credits"]
                            if s["project"] == name)
-        sw_rec = D().get("student_workers", {}).get(fy)
-        sw_count = len(sw_rec.get("data", [])) if sw_rec else 0
+        sw_count = sw_count_for_fy(fy)
         return {"Student Workers": sw_count, "Projects": proj_count,
                 "Budget": budget, "Credits": credits}
 
