@@ -9,7 +9,7 @@ from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
 from data import (load_data, save_data, blank_project, blank_line,
                   compute_master_totals, project_contracted_total,
                   wo_project_total, flat_invoice_rows, get_all_notifications,
-                  get_fy_options, project_in_fy, project_hours_summary,
+                  get_fy_options, project_in_fy, tool_in_fy, project_hours_summary,
                   count_tool_users, tool_share_costs, gist_configured,
                   fy_funding_rows, fy_carry_in_for, fy_budget_available,
                   fy_hours_available, fy_total_budget_added, fy_actual_spend,
@@ -1014,14 +1014,14 @@ elif page == "Student Workers":
     st.subheader("Load from Excel")
     up = st.file_uploader(
         f"Drag an Excel file here to load the {fy} student worker list",
-        type=["xlsx", "xls"], key="sw_upload",
+        type=["xlsx", "xls"], key=f"sw_upload_{fy}",
     )
     if up is not None:
         try:
             df_new = read_excel(up)
             st.caption(f"Preview — {len(df_new)} rows, {len(df_new.columns)} columns")
             st.dataframe(df_new, use_container_width=True, hide_index=True)
-            if st.button(f"💾 Save to {fy}", type="primary"):
+            if st.button(f"💾 Save to {fy}", type="primary", key=f"sw_save_{fy}"):
                 sw[fy] = df_to_store(df_new)
                 save()
                 st.toast(f"Saved {len(df_new)} student workers to {fy}")
@@ -1329,15 +1329,32 @@ elif page == "Tools":
     st.title("🛠️ Tools & Subscriptions")
     tools = D()["tools"]
 
-    # KPIs
-    total_m = total_a = 0.0
+    # Fiscal-year filter (based on each tool's start/end dates)
+    tfy_years = set()
     for t in tools:
+        for ds in (t.get("start_date", ""), t.get("end_date", "")):
+            d = parse_date(ds)
+            if d:
+                tfy_years.add(date_to_fy(d))
+    tfy_years.add(date_to_fy(date.today()))
+    tool_fy_opts = ["All"] + [fy_label(y) for y in sorted(tfy_years)]
+    tool_fy = st.selectbox("Fiscal Year", tool_fy_opts, key="tools_fy")
+
+    # Tools active in the selected FY, keeping their original index for edit/delete.
+    filtered = [(i, t) for i, t in enumerate(tools) if tool_in_fy(t, tool_fy)]
+
+    # KPIs (scoped to the selected FY)
+    total_m = total_a = 0.0
+    for _, t in filtered:
         mc, ac = calc_tool_costs(t)
         total_m += mc; total_a += ac
     mc1, mc2, mc3 = st.columns(3)
-    mc1.metric("Tools", len(tools))
+    mc1.metric("Tools", len(filtered))
     mc2.metric("Monthly Total", f"${total_m:,.2f}")
     mc3.metric("Annual Total", f"${total_a:,.2f}")
+    if tool_fy != "All":
+        st.caption(f"Showing tools active in {tool_fy} "
+                   "(a tool with no end date counts as ongoing from its start).")
 
     # Add / Edit tool using the same input form style
     st.subheader("Add / Edit Tool")
@@ -1375,8 +1392,12 @@ elif page == "Tools":
         t_start = tc2[1].date_input("Start Date",
                                     value=parse_date(selected_tool.get("start_date", "")),
                                     key=f"tool_start_{tool_mode}_{edit_tool_idx}")
-        t_renew = tc2[2].checkbox("Auto-renew", value=selected_tool.get("auto_renew", True))
-        t_paid = tc2[3].checkbox("Paid", value=selected_tool.get("paid", False))
+        t_end = tc2[2].date_input("End Date (blank = ongoing)",
+                                  value=parse_date(selected_tool.get("end_date", "")),
+                                  key=f"tool_end_{tool_mode}_{edit_tool_idx}")
+        t_renew = tc2[3].checkbox("Auto-renew", value=selected_tool.get("auto_renew", True))
+        tc3 = st.columns(4)
+        t_paid = tc3[0].checkbox("Paid", value=selected_tool.get("paid", False))
         t_notes = st.text_input("Notes", value=selected_tool.get("notes", ""))
 
         submit_label = "💾 Save New Tool" if tool_mode == "Add New" else "💾 Update Tool"
@@ -1387,6 +1408,7 @@ elif page == "Tools":
                     "cost": round(t_cost, 2),
                     "billing_cycle": t_cycle,
                     "start_date": str(t_start) if t_start else "",
+                    "end_date": str(t_end) if t_end else "",
                     "auto_renew": t_renew, "paid": t_paid,
                     "notes": t_notes,
                 }
@@ -1410,10 +1432,10 @@ elif page == "Tools":
             else:
                 st.error("Tool name is required.")
 
-    if tools:
+    if filtered:
         today = date.today()
         tool_data = []
-        for t in tools:
+        for _, t in filtered:
             mc, ac = calc_tool_costs(t)
             renewal = calc_renewal_date(t)
             n_users = count_tool_users(D(), t.get("name", ""))
@@ -1433,6 +1455,7 @@ elif page == "Tools":
                 "Used by": f"{n_users}" if n_users else "—",
                 "Per project / yr": per_proj,
                 "Start": fmt_date(t.get("start_date", "")),
+                "End": fmt_date(t.get("end_date", "")) if t.get("end_date") else "ongoing",
                 "Next Renewal": fmt_date(renewal) if renewal else "—",
                 "Auto": "Yes" if t.get("auto_renew") else "No",
                 "Paid": "☑" if t.get("paid") else "☐",
@@ -1443,10 +1466,10 @@ elif page == "Tools":
             on_select="rerun", selection_mode="single-row", key="tools_table",
         )
 
-        # Toggle paid / Delete on the selected row
+        # Toggle paid / Delete on the selected row (map back to the real index)
         sel = event.selection.rows
-        if sel and sel[0] < len(tools):
-            i = sel[0]
+        if sel and sel[0] < len(filtered):
+            i = filtered[sel[0]][0]
             st.caption(f"Selected: **{tools[i].get('name', '')}**")
             b1, b2 = st.columns(2)
             if b1.button("Toggle Paid ☐ ↔ ☑"):

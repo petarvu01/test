@@ -834,6 +834,26 @@ def project_in_fy(proj: dict, label: str) -> bool:
     return False
 
 
+def tool_in_fy(tool: dict, label: str) -> bool:
+    """Whether a tool/subscription is active in the given fiscal year.
+    A tool with no end date is treated as ongoing from its start date onward;
+    a tool with no start date shows in every FY."""
+    if label == "All":
+        return True
+    fy_s, fy_e = fy_range(label)
+    if not fy_s:
+        return True
+    t_start = parse_date(tool.get("start_date", ""))
+    t_end = parse_date(tool.get("end_date", ""))
+    if not t_start:
+        return True
+    if t_start > fy_e:
+        return False
+    if t_end is None:
+        return True
+    return t_end >= fy_s
+
+
 # ─── Overview KPIs (predefined, user-selectable) ──────────────────────────
 # Ordered (key, label) pairs — this is the menu users pick from.
 KPI_OPTIONS = [
