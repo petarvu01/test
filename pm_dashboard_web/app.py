@@ -1093,14 +1093,45 @@ elif page == "Credits":
             st.error(f"Couldn't read that file: {e}. Save it as .xlsx with "
                      "columns Name, Student ID, Credits, Project.")
 
-    # Current FY's credits + per-project totals
+    # ── Add / edit manually (like the Student Workers grid) ──
+    st.subheader(f"Add / edit students — {fy}")
+    st.caption("Type directly into the grid, or use the ＋ / row checkboxes to add and "
+               "remove rows, then Save. Rows left without a project are skipped on save.")
     cur = credits_for_fy(D(), fy)
     if cur:
-        st.subheader(f"Credits — {fy}")
-        df = pd.DataFrame(cur)[["name", "student_id", "credits", "project"]]
-        df.columns = ["Name", "Student ID", "Credits", "Project"]
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        seed = pd.DataFrame(cur)[["name", "student_id", "credits", "project"]]
+        seed.columns = ["Name", "Student ID", "Credits", "Project"]
+    else:
+        seed = pd.DataFrame(
+            [{"Name": "", "Student ID": "", "Credits": 0.0, "Project": ""}]
+        )
+    # Generation key so the grid remounts with the freshly saved rows after save.
+    gen = st.session_state.get(f"cred_editor_gen_{fy}", 0)
+    edited = st.data_editor(
+        seed, use_container_width=True, hide_index=True, num_rows="dynamic",
+        key=f"cred_editor_{fy}_{gen}",
+        column_config={
+            "Name": st.column_config.TextColumn("Name"),
+            "Student ID": st.column_config.TextColumn("Student ID"),
+            "Credits": st.column_config.NumberColumn(
+                "Credits", min_value=0.0, step=1.0, format="%g"),
+            "Project": st.column_config.TextColumn("Project"),
+        },
+    )
+    if st.button(f"💾 Save students to {fy}", type="primary", key=f"cred_manual_save_{fy}"):
+        records, err = parse_credit_rows(edited)
+        if err:
+            st.error(err)
+        else:
+            set_credits_for_fy(D(), fy, records)
+            save()
+            st.session_state[f"cred_editor_gen_{fy}"] = gen + 1
+            st.toast(f"Saved {len(records)} credit rows to {fy}")
+            st.rerun()
 
+    # Per-project totals + metrics from the saved data
+    cur = credits_for_fy(D(), fy)
+    if cur:
         totals = {}
         for r in cur:
             totals[r["project"]] = totals.get(r["project"], 0) + float(r.get("credits", 0) or 0)
@@ -1113,11 +1144,14 @@ elif page == "Credits":
         m1.metric("Students", len(cur))
         m2.metric(f"Total credits — {fy}", f"{sum(float(r.get('credits',0) or 0) for r in cur):g}")
 
+        df = pd.DataFrame(cur)[["name", "student_id", "credits", "project"]]
+        df.columns = ["Name", "Student ID", "Credits", "Project"]
         csv = df.to_csv(index=False)
         st.download_button("⬇️ Download CSV", csv,
                            f"credits_{fy.replace(' ', '_')}.csv", "text/csv")
     else:
-        st.info(f"No credits loaded for {fy} yet. Upload an .xlsx above.")
+        st.info(f"No credits saved for {fy} yet. Add students in the grid above "
+                "or upload an .xlsx.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
