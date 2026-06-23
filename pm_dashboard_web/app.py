@@ -1503,25 +1503,37 @@ elif page == "Tools":
     current_cycle = selected_tool.get("billing_cycle", "Monthly")
     cycle_index = cycle_options.index(current_cycle) if current_cycle in cycle_options else 0
 
+    # Generation counter: bumped after a successful save so the fields remount
+    # fresh (clears the Add New form; repopulates Edit from the selected tool).
+    gen = st.session_state.setdefault("tool_form_gen", 0)
+    kp = f"{tool_mode}_{edit_tool_idx}_{gen}"
+
     with st.form("tool_form"):
         tc = st.columns(3)
-        t_name = tc[0].text_input("Tool Name", value=selected_tool.get("name", ""))
-        t_vendor = tc[1].text_input("Vendor", value=selected_tool.get("vendor", ""))
+        t_name = tc[0].text_input("Tool Name", value=selected_tool.get("name", ""),
+                                  key=f"tool_name_{kp}")
+        t_vendor = tc[1].text_input("Vendor", value=selected_tool.get("vendor", ""),
+                                    key=f"tool_vendor_{kp}")
         t_cost = tc[2].number_input("Cost ($)",
                                     value=float(selected_tool.get("cost", 0.0)),
-                                    min_value=0.0, step=1.0, format="%.2f")
+                                    min_value=0.0, step=1.0, format="%.2f",
+                                    key=f"tool_cost_{kp}")
         tc2 = st.columns(4)
-        t_cycle = tc2[0].selectbox("Billing Cycle", cycle_options, index=cycle_index)
+        t_cycle = tc2[0].selectbox("Billing Cycle", cycle_options, index=cycle_index,
+                                   key=f"tool_cycle_{kp}")
         t_start = tc2[1].date_input("Start Date",
                                     value=parse_date(selected_tool.get("start_date", "")),
-                                    key=f"tool_start_{tool_mode}_{edit_tool_idx}")
+                                    key=f"tool_start_{kp}")
         t_end = tc2[2].date_input("End Date (blank = ongoing)",
                                   value=parse_date(selected_tool.get("end_date", "")),
-                                  key=f"tool_end_{tool_mode}_{edit_tool_idx}")
-        t_renew = tc2[3].checkbox("Auto-renew", value=selected_tool.get("auto_renew", True))
+                                  key=f"tool_end_{kp}")
+        t_renew = tc2[3].checkbox("Auto-renew", value=selected_tool.get("auto_renew", True),
+                                  key=f"tool_renew_{kp}")
         tc3 = st.columns(4)
-        t_paid = tc3[0].checkbox("Paid", value=selected_tool.get("paid", False))
-        t_notes = st.text_input("Notes", value=selected_tool.get("notes", ""))
+        t_paid = tc3[0].checkbox("Paid", value=selected_tool.get("paid", False),
+                                 key=f"tool_paid_{kp}")
+        t_notes = st.text_input("Notes", value=selected_tool.get("notes", ""),
+                                key=f"tool_notes_{kp}")
 
         submit_label = "💾 Save New Tool" if tool_mode == "Add New" else "💾 Update Tool"
         if st.form_submit_button(submit_label):
@@ -1551,6 +1563,8 @@ elif page == "Tools":
                     tools.append(tool_payload)
 
                 save()
+                # Remount the form fields fresh (clears inputs after saving).
+                st.session_state["tool_form_gen"] = gen + 1
                 st.rerun()
             else:
                 st.error("Tool name is required.")
