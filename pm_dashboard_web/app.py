@@ -33,7 +33,10 @@ def D():
 
 
 def save():
-    save_data(D())
+    ok = save_data(D())
+    if ok is False:
+        st.toast("⚠️ Cloud save failed — saved locally only. "
+                 "Check your connection or Gist token, then re-save.", icon="⚠️")
 
 
 def projects_sorted():
@@ -1205,6 +1208,7 @@ elif page == "Invoices / WO":
                         "sent": sent, "paid": paid,
                     })
                     save()
+                    st.toast("Invoice saved")
                     st.rerun()
         else:
             st.markdown("**Add installments below, then click Save Work Order.**")
@@ -1228,7 +1232,7 @@ elif page == "Invoices / WO":
                         "net_terms": inst_net, "due_date": _date_to_str(inst_due),
                         "sent": False, "paid": False,
                     })
-                    st.success("Installment added. Add another or save the work order.")
+                    st.toast("Installment added — add another or save the work order.")
                     st.rerun()
 
             if save_wo and num_field:
@@ -1243,7 +1247,9 @@ elif page == "Invoices / WO":
                     save()
                     st.session_state.wo_installments = []
                     if abs(wo_t - contracted) > 0.01 and (wo_t > 0 or contracted > 0):
-                        st.warning(f"⚠️ WO total ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f}")
+                        st.toast(f"⚠️ WO total ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f}")
+                    else:
+                        st.toast("Work order saved")
                     st.rerun()
                 else:
                     st.error("Add at least one installment.")

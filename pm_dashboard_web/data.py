@@ -348,6 +348,8 @@ def load_data() -> dict:
 
 
 def save_data(data: dict):
+    """Persist data. Returns True if the gist write succeeded, False if it was
+    attempted but failed, and None if the gist isn't configured (local-only)."""
     # Always write the local cache (fast, and a fallback if the gist is briefly down).
     _write_local(data)
     try:
@@ -355,7 +357,9 @@ def save_data(data: dict):
     except Exception:
         pass
     # Push to the durable gist store.
-    _save_to_gist(data)
+    if not gist_configured():
+        return None
+    return _save_to_gist(data)
 
 
 def _auto_backup():
