@@ -976,36 +976,111 @@ DEFAULT_KPIS = ["active_projects", "total_credits", "total_budget", "total_stu_p
 KPI_LABELS = dict(KPI_OPTIONS)
 
 
-def compute_kpis(data: dict) -> dict:
-    """Compute every predefined KPI. Returns {key: formatted_value_string}."""
-    totals = compute_master_totals(data)
-    pr = data.get("project_records", {})
-
-    # Actuals = personnel + PI + actual travel + each project's tool share
-    actuals = 0.0
-    for name, proj in pr.items():
-        for r in proj.get("lines", []):
+def kpi_fy_options(data: dict) -> list:
+    """Fiscal years that have data anywhere (project dates, line items,
+    contracted hours, credits, or invoices), for the Overview FY filter.
+    Always includes 'All' first and the current FY so the filter is usable."""
+    years = set()
+    for proj in data.get("project_records", {}).values():
+        for k in (proj.get("lines_by_fy") or {}):
             try:
-                actuals += int(r[1]) * float(r[2]) * float(r[3])   # student personnel
-                actuals += float(r[4]) * float(r[5])               # PI
-                actuals += float(r[8])                             # actual travel
-            except (TypeError, ValueError, IndexError):
+                years.add(int(k))
+            except (TypeError, ValueError):
                 pass
-        for tn in proj.get("assigned_tools", []):
-            t = next((x for x in data.get("tools", []) if x.get("name") == tn), None)
-            if t:
-                _, a = tool_share_costs(data, t, name)
-                actuals += a
+        for k in (proj.get("contracted_hours_by_fy") or {}):
+            try:
+                years.add(int(k))
+            except (TypeError, ValueError):
+                pass
+        ext = proj.get("extension_date", "")
+        for ds in (proj.get("start_date", ""), ext or proj.get("end_date", "")):
+            d = parse_date(ds)
+            if d:
+                years.add(date_to_fy(d))
+    for k in (data.get("student_credits_by_fy") or {}):
+        yy = _fy_year_of(k)
+        if yy is not None:
+            years.add(yy)
+    for rec in data.get("invoices", []):
+        if rec.get("type") == "Work Order":
+            for inst in rec.get("installments", []):
+                d = parse_date(inst.get("due_date", ""))
+                if d:
+                    years.add(date_to_fy(d))
+        else:
+            d = parse_date(rec.get("due_date", ""))
+            if d:
+                years.add(date_to_fy(d))
+    years.add(date_to_fy(date.today()))
+    return ["All"] + [fy_label(y) for y in sorted(years)]
 
-    cont_hours = 0.0
-    hours_deducted = 0.0
-    for p in pr.values():
-        b, ded = project_hours_summary(p)
-        cont_hours += b
-        if b > 0:
-            hours_deducted += ded
 
-    rows = flat_invoice_rows(data)
+def compute_kpis(data: dict, fy: str = "All") -> dict:
+    """Compute every predefined KPI as formatted strings.
+
+    fy='All' returns whole-dataset values (unchanged). For a specific FY label,
+    every figure is scoped to that fiscal year using the same per-FY logic the
+    rest of the app uses. Tools are subscriptions with no fiscal-year dimension,
+    so the Tools / Tool Cost KPIs always reflect all tools regardless of fy."""
+    pr = data.get("project_records", {})
+    scoped = fy != "All"
+    y = _fy_year_of(fy) if scoped else None
+
+    if scoped and y is not None:
+        active_projects = sum(1 for p in pr.values() if project_in_fy(p, fy))
+        total_credits = sum(float(r.get("credits", 0) or 0)
+                            for r in credits_for_fy(data, fy))
+        total_budget = sum(fy_contracted_budget(p, y) for p in pr.values()
+                           if not p.get("has_budget", False))
+        total_stu = total_pi = 0.0
+        for p in pr.values():
+            for r in fy_lines(p, y):
+                r = validate_line(r)
+                total_stu += int(r[1]) * float(r[2]) * float(r[3])
+                total_pi  += float(r[4]) * float(r[5])
+        actuals = sum(fy_actual_spend(p, y) for p in pr.values())
+        cont_hours = hours_deducted = 0.0
+        for p in pr.values():
+            hb = fy_contracted_hours(p, y)
+            cont_hours += hb
+            if hb > 0:
+                hours_deducted += fy_hours_spend(p, y)
+        rows = []
+        for r in flat_invoice_rows(data):
+            d = parse_date(r["due_date"])
+            if d and date_to_fy(d) == y:
+                rows.append(r)
+        students_count = len(credits_for_fy(data, fy))
+    else:
+        totals = compute_master_totals(data)
+        active_projects = totals["active_projects"]
+        total_credits = totals["total_credits"]
+        total_budget = totals["total_budget"]
+        total_stu = totals["total_stu_personnel"]
+        total_pi = totals["total_pi_cost"]
+        actuals = 0.0
+        for name, proj in pr.items():
+            for r in proj.get("lines", []):
+                try:
+                    actuals += int(r[1]) * float(r[2]) * float(r[3])   # student personnel
+                    actuals += float(r[4]) * float(r[5])               # PI
+                    actuals += float(r[8])                             # actual travel
+                except (TypeError, ValueError, IndexError):
+                    pass
+            for tn in proj.get("assigned_tools", []):
+                t = next((x for x in data.get("tools", []) if x.get("name") == tn), None)
+                if t:
+                    _, a = tool_share_costs(data, t, name)
+                    actuals += a
+        cont_hours = hours_deducted = 0.0
+        for p in pr.values():
+            b, ded = project_hours_summary(p)
+            cont_hours += b
+            if b > 0:
+                hours_deducted += ded
+        rows = flat_invoice_rows(data)
+        students_count = len(data.get("student_credits", []))
+
     unpaid = [r for r in rows if not r["paid"]]
     unpaid_amount = sum(r["inst_amount"] for r in unpaid)
     today = date.today()
@@ -1022,11 +1097,11 @@ def compute_kpis(data: dict) -> dict:
         tools_annual += a
 
     return {
-        "active_projects":      f"{totals['active_projects']}",
-        "total_credits":        f"{totals['total_credits']}",
-        "total_budget":         f"${totals['total_budget']:,.2f}",
-        "total_stu_personnel":  f"${totals['total_stu_personnel']:,.2f}",
-        "total_pi_cost":        f"${totals['total_pi_cost']:,.2f}",
+        "active_projects":      f"{active_projects}",
+        "total_credits":        f"{total_credits:g}",
+        "total_budget":         f"${total_budget:,.2f}",
+        "total_stu_personnel":  f"${total_stu:,.2f}",
+        "total_pi_cost":        f"${total_pi:,.2f}",
         "total_actuals":        f"${actuals:,.2f}",
         "total_cont_hours":     f"{cont_hours:,.0f} hrs",
         "total_hours_deducted": f"{hours_deducted:,.0f} hrs",
@@ -1036,5 +1111,5 @@ def compute_kpis(data: dict) -> dict:
         "overdue_count":        f"{overdue}",
         "tools_count":          f"{len(tools)}",
         "tools_annual":         f"${tools_annual:,.2f}",
-        "students_count":       f"{len(data.get('student_credits', []))}",
+        "students_count":       f"{students_count}",
     }

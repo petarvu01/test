@@ -19,7 +19,7 @@ from data import (load_data, save_data, blank_project, blank_line,
                   fy_contracted_budget, fy_contracted_hours, fy_hours_summary,
                   tool_users, tool_split_for, tool_split_amounts,
                   tool_has_custom_split, tool_split_status,
-                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS)
+                  compute_kpis, KPI_OPTIONS, KPI_LABELS, DEFAULT_KPIS, kpi_fy_options)
 
 st.set_page_config(page_title="PM Dashboard", page_icon="📁", layout="wide")
 
@@ -335,7 +335,19 @@ if page == "Overview":
     selected_kpis = [k for k in D().get("overview_kpis", DEFAULT_KPIS) if k in KPI_LABELS]
     if not selected_kpis:
         selected_kpis = list(DEFAULT_KPIS)
-    kpi_values = compute_kpis(D())
+
+    # Fiscal-year filter (a per-session view setting — not saved/shared).
+    fy_opts = kpi_fy_options(D())
+    fcol, _ = st.columns([1, 3])
+    overview_fy = fcol.selectbox(
+        "Fiscal year", fy_opts, key="overview_fy",
+        help="Scope the KPIs below to one fiscal year. 'All' shows whole-dataset "
+             "totals. Tools have no fiscal year, so the Tools KPIs always show all.",
+    )
+    if overview_fy != "All":
+        st.caption(f"Showing KPIs for **{overview_fy}**. Active Projects counts "
+                   "projects running in this fiscal year; Tools KPIs aren't FY-scoped.")
+    kpi_values = compute_kpis(D(), fy=overview_fy)
 
     for start in range(0, len(selected_kpis), 4):
         chunk = selected_kpis[start:start + 4]
@@ -368,10 +380,22 @@ if page == "Overview":
     col_left, col_right = st.columns([2, 3])
 
     with col_left:
-        st.subheader("Hours Utilization")
+        if overview_fy == "All":
+            st.subheader("Hours Utilization")
+            ov_year = None
+        else:
+            st.subheader(f"Hours Utilization — {overview_fy}")
+            try:
+                ov_year = int(overview_fy.split()[1].split("-")[0])
+            except (IndexError, ValueError):
+                ov_year = None
         items = []
         for name, proj in sorted(D()["project_records"].items()):
-            budget, used = project_hours_summary(proj)
+            if ov_year is None:
+                budget, used = project_hours_summary(proj)
+            else:
+                # FY-scoped: available (carry-in + contracted) vs spent this year.
+                budget, used, _ = fy_hours_summary(proj, ov_year)
             if budget <= 0:
                 continue
             pct = used / budget * 100
@@ -383,8 +407,10 @@ if page == "Overview":
                 st.markdown(f"**{item['Project']}** {color}")
                 st.progress(min(pct / 100, 1.0))
                 st.caption(f"{item['Used']:.0f} / {item['Budget']:.0f} hrs ({pct:.0f}%)")
-        else:
+        elif overview_fy == "All":
             st.info("No projects with contracted hours set.")
+        else:
+            st.info(f"No projects with contracted hours in {overview_fy}.")
 
     with col_right:
         st.subheader("⚠️ Alerts")
