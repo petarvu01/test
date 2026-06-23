@@ -345,8 +345,9 @@ if page == "Overview":
              "totals. Tools have no fiscal year, so the Tools KPIs always show all.",
     )
     if overview_fy != "All":
-        st.caption(f"Showing KPIs for **{overview_fy}**. Active Projects counts "
-                   "projects running in this fiscal year; Tools KPIs aren't FY-scoped.")
+        st.caption(f"Showing KPIs for **{overview_fy}**. Active Projects and Hours "
+                   "Utilization cover projects running in this fiscal year; Tools "
+                   "cover subscriptions active in it.")
     kpi_values = compute_kpis(D(), fy=overview_fy)
 
     for start in range(0, len(selected_kpis), 4):
@@ -394,7 +395,10 @@ if page == "Overview":
             if ov_year is None:
                 budget, used = project_hours_summary(proj)
             else:
-                # FY-scoped: available (carry-in + contracted) vs spent this year.
+                # Only projects actually running in this FY (by their dates),
+                # then this FY's available (carry-in + contracted) vs spent.
+                if not project_in_fy(proj, overview_fy):
+                    continue
                 budget, used, _ = fy_hours_summary(proj, ov_year)
             if budget <= 0:
                 continue

@@ -1020,8 +1020,8 @@ def compute_kpis(data: dict, fy: str = "All") -> dict:
 
     fy='All' returns whole-dataset values (unchanged). For a specific FY label,
     every figure is scoped to that fiscal year using the same per-FY logic the
-    rest of the app uses. Tools are subscriptions with no fiscal-year dimension,
-    so the Tools / Tool Cost KPIs always reflect all tools regardless of fy."""
+    rest of the app uses. Tool KPIs are scoped by each tool's active date range
+    (tool_in_fy), matching the Tools tab's fiscal-year filter."""
     pr = data.get("project_records", {})
     scoped = fy != "All"
     y = _fy_year_of(fy) if scoped else None
@@ -1090,7 +1090,11 @@ def compute_kpis(data: dict, fy: str = "All") -> dict:
         if d and d < today:
             overdue += 1
 
-    tools = data.get("tools", [])
+    tools_all = data.get("tools", [])
+    if scoped and y is not None:
+        tools = [t for t in tools_all if tool_in_fy(t, fy)]
+    else:
+        tools = tools_all
     tools_annual = 0.0
     for t in tools:
         _, a = calc_tool_costs(t)
