@@ -1265,9 +1265,11 @@ elif page == "Invoices / WO":
     # ALL RECORDS  (edit inline, then confirm before changes are written)
     # ══════════════════════════════════════════════════════════════════
     st.subheader("All Records")
-    st.caption("Edit any cell directly in the table below — including the **Delete** "
-               "box to remove a row — then click **Review changes**. Nothing is saved "
-               "until you confirm. **Payment Due** and **WO Total** are computed.")
+    st.caption("Edit any cell directly in the table below. To remove a row, tick its "
+               "**🗑️ Delete** box (first column), then click **Review changes** — nothing "
+               "is saved until you confirm. A Work Order shows one row per installment; "
+               "tick every installment row to delete the whole Work Order. "
+               "**Payment Due** and **WO Total** are computed.")
 
     if "inv_editor_gen" not in st.session_state:
         st.session_state.inv_editor_gen = 0
@@ -1279,6 +1281,7 @@ elif page == "Invoices / WO":
         st.info("No records yet. Add an invoice or work order above.")
     else:
         edit_df = pd.DataFrame([{
+            "Delete": False,
             "Type": r["type"],
             "Number": str(r["number"]),
             "Project": r["project"],
@@ -1291,7 +1294,6 @@ elif page == "Invoices / WO":
             "Paid": bool(r["paid"]),
             "Payment Due": fmt_date(r["payment_due"]),
             "WO Total": f"${r['wo_total']:,.2f}" if r["type"] == "Work Order" else "",
-            "Delete": False,
         } for r in flat])
 
         money_col = st.column_config.NumberColumn(min_value=0.0, step=1.0, format="$%.2f")
@@ -1299,6 +1301,7 @@ elif page == "Invoices / WO":
             edit_df, use_container_width=True, hide_index=True, num_rows="fixed",
             key=f"inv_editor_{st.session_state.inv_editor_gen}",
             column_config={
+                "Delete": st.column_config.CheckboxColumn("🗑️ Delete", help="Tick to remove this row on save", width="small"),
                 "Type": st.column_config.TextColumn(disabled=True, width="small"),
                 "Number": st.column_config.TextColumn(required=True),
                 "Project": st.column_config.SelectboxColumn(options=projects_sorted(), required=True),
@@ -1311,7 +1314,6 @@ elif page == "Invoices / WO":
                 "Paid": st.column_config.CheckboxColumn(),
                 "Payment Due": st.column_config.TextColumn(disabled=True),
                 "WO Total": st.column_config.TextColumn(disabled=True),
-                "Delete": st.column_config.CheckboxColumn(help="Tick to remove this row on save"),
             },
         )
 
