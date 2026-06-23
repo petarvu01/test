@@ -341,8 +341,9 @@ if page == "Overview":
     fcol, _ = st.columns([1, 3])
     overview_fy = fcol.selectbox(
         "Fiscal year", fy_opts, key="overview_fy",
-        help="Scope the KPIs below to one fiscal year. 'All' shows whole-dataset "
-             "totals. Tools have no fiscal year, so the Tools KPIs always show all.",
+        help="Scope every KPI below to one fiscal year — including the Tools KPIs, "
+             "which are scoped by each tool's active date range. 'All' shows "
+             "whole-dataset totals across every fiscal year.",
     )
     if overview_fy != "All":
         st.caption(f"Showing KPIs for **{overview_fy}**. Active Projects and Hours "
@@ -1445,8 +1446,16 @@ elif page == "Tools":
             if d:
                 tfy_years.add(date_to_fy(d))
     tfy_years.add(date_to_fy(date.today()))
-    tool_fy_opts = ["All"] + [fy_label(y) for y in sorted(tfy_years)]
-    tool_fy = st.selectbox("Fiscal Year", tool_fy_opts, key="tools_fy")
+    # Individual fiscal years only (no "All") — default to the current FY.
+    tool_fy_opts = [fy_label(y) for y in sorted(tfy_years)]
+    cur_fy_lbl = fy_label(date_to_fy(date.today()))
+    tool_fy_idx = (tool_fy_opts.index(cur_fy_lbl)
+                   if cur_fy_lbl in tool_fy_opts else len(tool_fy_opts) - 1)
+    # Clear any stored value left over from when "All" was an option.
+    if st.session_state.get("tools_fy") not in tool_fy_opts:
+        st.session_state.pop("tools_fy", None)
+    tool_fy = st.selectbox("Fiscal Year", tool_fy_opts,
+                           index=tool_fy_idx, key="tools_fy")
 
     # Tools active in the selected FY, keeping their original index for edit/delete.
     filtered = [(i, t) for i, t in enumerate(tools) if tool_in_fy(t, tool_fy)]
@@ -1578,6 +1587,13 @@ elif page == "Tools":
         event = st.dataframe(
             pd.DataFrame(tool_data), use_container_width=True, hide_index=True,
             on_select="rerun", selection_mode="single-row", key="tools_table",
+            column_config={
+                "Notes": st.column_config.TextColumn(
+                    "Notes", width="large",
+                    help="Drag the column border to widen, or scroll the table "
+                         "sideways to read the full note.",
+                ),
+            },
         )
 
         # Toggle paid / Delete on the selected row (map back to the real index)
