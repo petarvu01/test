@@ -1607,9 +1607,24 @@ elif page == "Tools":
                 save()
                 st.rerun()
             if b2.button("🗑️ Delete Tool"):
-                tools.pop(i)
-                save()
-                st.rerun()
+                st.session_state["confirm_del_tool"] = i
+            # Reset a pending confirmation if a different row got selected.
+            if (st.session_state.get("confirm_del_tool") is not None
+                    and st.session_state["confirm_del_tool"] != i):
+                st.session_state.pop("confirm_del_tool", None)
+            # Two-step confirmation so a tool is never removed by a stray click.
+            if st.session_state.get("confirm_del_tool") == i:
+                st.warning(f"Remove **{tools[i].get('name', '')}**? "
+                           "This can't be undone.")
+                cd1, cd2 = st.columns(2)
+                if cd1.button("✅ Yes, remove it", key=f"del_yes_{i}"):
+                    tools.pop(i)
+                    st.session_state.pop("confirm_del_tool", None)
+                    save()
+                    st.rerun()
+                if cd2.button("↩️ Cancel", key=f"del_no_{i}"):
+                    st.session_state.pop("confirm_del_tool", None)
+                    st.rerun()
 
             # ── Cost split editor (only meaningful when 2+ projects share it) ──
             t_sel = tools[i]
