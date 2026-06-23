@@ -10,10 +10,12 @@ from data import (load_data, save_data, blank_project, blank_line,
                   compute_master_totals, project_contracted_total,
                   wo_project_total, flat_invoice_rows, get_all_notifications,
                   get_fy_options, project_in_fy, tool_in_fy, project_hours_summary,
+                  credits_for_fy, project_credits, set_credits_for_fy,
                   count_tool_users, tool_share_costs, gist_configured,
                   fy_funding_rows, fy_carry_in_for, fy_budget_available,
                   fy_hours_available, fy_total_budget_added, fy_actual_spend,
                   fy_hours_spend, fy_lines, flatten_lines, project_primary_fy,
+                  project_note_for_fy, set_project_note_for_fy,
                   fy_contracted_budget, fy_contracted_hours, fy_hours_summary,
                   tool_users, tool_split_for, tool_split_amounts,
                   tool_has_custom_split, tool_split_status,
@@ -151,6 +153,45 @@ def store_to_df(store):
     if not store:
         return pd.DataFrame()
     return pd.DataFrame(store.get("data", []), columns=store.get("columns", []))
+
+
+def parse_credit_rows(df):
+    """Map a credits DataFrame (Name, Student ID, Credits, Project) to records.
+    Column matching is case-insensitive. Returns (records, error_message)."""
+    cols = {str(c).strip().lower(): c for c in df.columns}
+
+    def find(*needles):
+        for n in needles:
+            for low, orig in cols.items():
+                if n in low:
+                    return orig
+        return None
+
+    c_name = find("name")
+    c_id = find("student id", "id")
+    c_cred = find("credit")
+    c_proj = find("project")
+    missing = [lbl for lbl, c in
+               [("Credits", c_cred), ("Project", c_proj)] if c is None]
+    if missing:
+        return [], (f"Missing required column(s): {', '.join(missing)}. "
+                    "The file needs columns: Name, Student ID, Credits, Project.")
+    records = []
+    for _, row in df.iterrows():
+        proj = "" if c_proj is None or pd.isna(row[c_proj]) else str(row[c_proj]).strip()
+        if not proj:
+            continue  # skip rows with no project
+        try:
+            creds = float(row[c_cred]) if pd.notna(row[c_cred]) else 0.0
+        except (TypeError, ValueError):
+            creds = 0.0
+        records.append({
+            "name": "" if c_name is None or pd.isna(row[c_name]) else str(row[c_name]).strip(),
+            "student_id": "" if c_id is None or pd.isna(row[c_id]) else str(row[c_id]).strip(),
+            "credits": creds,
+            "project": proj,
+        })
+    return records, None
 
 
 # ─── Custom CSS ──────────────────────────────────────────────────────────
@@ -388,7 +429,10 @@ elif page == "Project View":
         dc1, dc2, _ = st.columns([1, 1, 4])
         if dc1.button("Yes, delete", type="primary"):
             del pr[active]
-            D()["student_credits"] = [s for s in D()["student_credits"] if s["project"] != active]
+            scbf = D().setdefault("student_credits_by_fy", {})
+            for k in list(scbf.keys()):
+                scbf[k] = [s for s in scbf[k] if s.get("project") != active]
+            D()["student_credits"] = [s for recs in scbf.values() for s in recs]
             st.session_state.confirm_del_proj = False
             save()
             st.toast(f"Removed {active}")
@@ -693,19 +737,22 @@ elif page == "Project View":
         st.caption("No contracted hours set for this fiscal year — hours tracking "
                    "is off. Enter a value above to turn it on.")
 
-    # Notes
+    # Notes — kept separately for each fiscal year (uses the Fiscal Year filter above)
     st.subheader("Notes")
-    st.caption(f"Notes for: **{active}** (each project keeps its own)")
-    notes = st.text_area("Project notes", value=proj.get("notes", ""), key=f"proj_notes_{active}")
-    # Write straight to THIS project. Auto-saves on change so switching
-    # projects never mixes or loses notes, even if you forget the button.
-    if notes != proj.get("notes", ""):
-        proj["notes"] = notes
+    st.caption(f"Notes for **{active}** — {view_fy_label}. Each fiscal year keeps "
+               "its own notes; change the Fiscal Year filter above to write notes "
+               "for another year.")
+    cur_note = project_note_for_fy(proj, view_year)
+    notes = st.text_area("Project notes", value=cur_note,
+                         key=f"proj_notes_{active}_{view_key}")
+    # Auto-save to THIS fiscal year so switching project or FY never loses notes.
+    if notes != cur_note:
+        set_project_note_for_fy(proj, view_year, notes)
         save()
-    if st.button("💾 Save Notes", key=f"save_notes_{active}"):
-        proj["notes"] = notes
+    if st.button("💾 Save Notes", key=f"save_notes_{active}_{view_key}"):
+        set_project_note_for_fy(proj, view_year, notes)
         save()
-        st.toast("Notes saved")
+        st.toast(f"Notes saved for {view_fy_label}")
 
     # Tool assignments
     st.subheader("Assigned Tools")
@@ -842,7 +889,7 @@ elif page == "Master View":
         stu = sum(actual_personnel_cost(row) for row in scope_lines)
         pi = sum(actual_pi_cost(row) for row in scope_lines)
         ch_budget, _ = project_hours_summary(proj)
-        credits = sum(s["credits"] for s in D()["student_credits"] if s["project"] == name)
+        credits = project_credits(D(), fy, name)
         ext = proj.get("extension_date", "")
         ed = proj.get("end_date", "")
         end_disp = fmt_date(ext if ext else ed) + (" ★" if ext else "")
@@ -982,45 +1029,61 @@ elif page == "Actual vs Budget":
 # ═════════════════════════════════════════════════════════════════════════
 elif page == "Credits":
     st.title("🎓 Student Credits")
-    credits = D()["student_credits"]
+    D().setdefault("student_credits_by_fy", {})
+    fy = st.selectbox("Fiscal Year", fy_choices(), key="cred_fy")
 
-    with st.form("add_credit"):
-        st.subheader("Assign Credits")
-        cc = st.columns(4)
-        name = cc[0].text_input("Student Name")
-        sid = cc[1].text_input("Student ID")
-        creds = cc[2].number_input("Credits", min_value=1, value=3)
-        proj = cc[3].selectbox("Project", projects_sorted())
-        if st.form_submit_button("Assign"):
-            if name and sid:
-                if any(s["student_id"] == sid for s in credits):
-                    st.error(f"Student ID '{sid}' already registered.")
-                else:
-                    credits.append({"name": name, "student_id": sid,
-                                    "credits": creds, "project": proj})
-                    save()
-                    st.rerun()
+    st.subheader("Load from Excel")
+    st.caption("Required columns: **Name, Student ID, Credits, Project** "
+               "(one row per student). Uploading replaces this fiscal year's credits.")
+    nonce = st.session_state.get(f"cred_nonce_{fy}", 0)
+    up = st.file_uploader(
+        f"Drag an Excel (.xlsx) file here to load {fy} credits",
+        type=["xlsx"], key=f"cred_upload_{fy}_{nonce}",
+    )
+    if up is not None:
+        try:
+            df_new = read_excel(up)
+            records, err = parse_credit_rows(df_new)
+            if err:
+                st.error(err)
             else:
-                st.error("Name and ID are required.")
+                st.caption(f"Preview — {len(records)} students with a project")
+                st.dataframe(df_new, use_container_width=True, hide_index=True)
+                if st.button(f"💾 Save to {fy}", type="primary", key=f"cred_save_{fy}"):
+                    set_credits_for_fy(D(), fy, records)
+                    save()
+                    st.session_state[f"cred_nonce_{fy}"] = nonce + 1
+                    st.toast(f"Saved {len(records)} credit rows to {fy}")
+                    st.rerun()
+        except Exception as e:
+            st.error(f"Couldn't read that file: {e}. Save it as .xlsx with "
+                     "columns Name, Student ID, Credits, Project.")
 
-    if credits:
-        df = pd.DataFrame(credits)
+    # Current FY's credits + per-project totals
+    cur = credits_for_fy(D(), fy)
+    if cur:
+        st.subheader(f"Credits — {fy}")
+        df = pd.DataFrame(cur)[["name", "student_id", "credits", "project"]]
         df.columns = ["Name", "Student ID", "Credits", "Project"]
-        event = st.dataframe(
-            df, use_container_width=True, hide_index=True,
-            on_select="rerun", selection_mode="single-row", key="credits_table",
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        totals = {}
+        for r in cur:
+            totals[r["project"]] = totals.get(r["project"], 0) + float(r.get("credits", 0) or 0)
+        st.subheader("Totals per project")
+        tdf = pd.DataFrame(
+            [{"Project": p, "Total Credits": c} for p, c in sorted(totals.items())]
         )
-        sel = event.selection.rows
-        if sel and sel[0] < len(credits):
-            i = sel[0]
-            st.caption(f"Selected: **{credits[i]['name']}** ({credits[i]['student_id']})")
-            if st.button("🗑️ Remove Student"):
-                rem_id = credits[i]["student_id"]
-                D()["student_credits"] = [s for s in credits if s["student_id"] != rem_id]
-                save()
-                st.rerun()
-        else:
-            st.caption("Click a row above to remove a student.")
+        st.dataframe(tdf, use_container_width=True, hide_index=True)
+        m1, m2 = st.columns(2)
+        m1.metric("Students", len(cur))
+        m2.metric(f"Total credits — {fy}", f"{sum(float(r.get('credits',0) or 0) for r in cur):g}")
+
+        csv = df.to_csv(index=False)
+        st.download_button("⬇️ Download CSV", csv,
+                           f"credits_{fy.replace(' ', '_')}.csv", "text/csv")
+    else:
+        st.info(f"No credits loaded for {fy} yet. Upload an .xlsx above.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1090,262 +1153,242 @@ elif page == "Student Workers":
 elif page == "Invoices / WO":
     st.title("📄 Invoices & Work Orders")
 
-    fc1, fc2, fc3 = st.columns([1, 1, 1])
-    show_hist = fc1.checkbox("Show historical", key="inv_hist")
-    proj_filter = fc2.selectbox("Filter project", ["All"] + projects_sorted(), key="inv_proj_f")
-    inv_type = fc3.radio("Type", ["Invoice", "Work Order"], horizontal=True)
-
-    # Build the current flat list before the form so the same input area can edit existing rows.
-    flat = flat_invoice_rows(D(), show_hist=show_hist, proj_filter=proj_filter)
-
-    action_mode = st.radio(
-        "Action",
-        ["Add New", "Edit Existing"],
-        horizontal=True,
-        key="invoice_action_mode",
-        disabled=not bool(flat),
-    )
-    if not flat:
-        action_mode = "Add New"
-
-    edit_row = edit_rec = edit_inst = None
+    # ── Filters: project + the Invoice/Work-Order toggle (no historical filter;
+    #    the table always shows every record so nothing is hidden). ──
+    fc1, fc2 = st.columns([1, 1])
+    proj_filter = fc1.selectbox("Filter project", ["All"] + projects_sorted(), key="inv_proj_f")
+    inv_type = fc2.radio("Type to add", ["Invoice", "Work Order"], horizontal=True, key="inv_add_type")
     form_type = inv_type
-    if action_mode == "Edit Existing" and flat:
-        edit_pick = st.selectbox(
-            "Record to edit",
-            range(len(flat)),
-            format_func=lambda i: f"{flat[i]['type']} #{flat[i]['number']} — "
-                                  f"{flat[i]['project']} — ${flat[i]['inst_amount']:,.2f}",
-            key="invoice_edit_row_picker",
-        )
-        edit_row = flat[edit_pick]
-        edit_rec = edit_row["_rec"]
-        edit_inst = edit_row["_inst"]
-        form_type = edit_row["type"]
-        st.caption(f"Editing: {form_type} #{edit_row['number']} — {edit_row['project']}")
 
-    with st.form("add_edit_inv"):
-        st.subheader(f"{'Edit' if action_mode == 'Edit Existing' else 'Add'} {form_type}")
+    NET_OPTIONS = ["Net 30", "Net 60", "Net 90", "Net 120"]
+
+    def _date_to_str(d):
+        """data_editor / date_input value → 'YYYY-MM-DD' string (or '')."""
+        if d is None or (isinstance(d, float) and pd.isna(d)):
+            return ""
+        try:
+            return pd.to_datetime(d).date().isoformat()
+        except Exception:
+            return str(d)[:10] if d else ""
+
+    # ══════════════════════════════════════════════════════════════════
+    # ADD NEW  (input boxes only — editing happens inline in the table below)
+    # ══════════════════════════════════════════════════════════════════
+    with st.form("add_inv"):
+        st.subheader(f"➕ Add {form_type}")
         ic = st.columns(3)
-
-        default_number = edit_rec.get("number", "") if edit_rec else ""
-        default_project = edit_rec.get("project", "") if edit_rec else ""
         project_options = projects_sorted()
-        project_index = project_options.index(default_project) if default_project in project_options else 0
-
-        if action_mode == "Edit Existing" and edit_inst is not None:
-            default_desc = edit_inst.get("period", edit_row.get("description", ""))
-        elif action_mode == "Edit Existing" and edit_rec is not None:
-            default_desc = edit_rec.get("description", "")
-        else:
-            default_desc = ""
-
-        num_field = ic[0].text_input("Number", value=default_number, key="invwo_number")
-        proj = ic[1].selectbox("Project", project_options, index=project_index, key="invwo_project")
+        num_field = ic[0].text_input("Number", value="", key="invwo_number")
+        proj = ic[1].selectbox("Project", project_options, key="invwo_project")
         desc_label = "Period / Label" if form_type == "Work Order" else "Description"
-        desc = ic[2].text_input(desc_label, value=default_desc, key="invwo_description")
+        desc = ic[2].text_input(desc_label, value="", key="invwo_description")
 
         if form_type == "Invoice":
-            default_amt = float(edit_rec.get("amount", 0)) if edit_rec else 0.0
-            default_net = edit_rec.get("net_terms", "Net 30") if edit_rec else "Net 30"
-            default_due = parse_date(edit_rec.get("due_date", "")) if edit_rec else None
-            default_hrs = float(edit_rec.get("hours_deducted") or 0) if edit_rec else 0.0
-            default_sent = bool(edit_rec.get("sent", False)) if edit_rec else False
-            default_paid = bool(edit_rec.get("paid", False)) if edit_rec else False
-
-            net_options = ["Net 30", "Net 60", "Net 90", "Net 120"]
-            net_index = net_options.index(default_net) if default_net in net_options else 0
-
             ic2 = st.columns(4)
-            amt = ic2[0].number_input("Amount ($)", value=default_amt, step=1.0, format="%.2f", key="invoice_amount")
-            net = ic2[1].selectbox("Net Terms", net_options, index=net_index, key="invoice_net_terms")
-            due = ic2[2].date_input("Invoice Date", value=default_due, key="inv_due")
-            hrs_ded = ic2[3].number_input("Hours deducted", value=default_hrs, step=0.5, format="%.1f", key="invoice_hours_deducted")
+            amt = ic2[0].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="invoice_amount")
+            net = ic2[1].selectbox("Net Terms", NET_OPTIONS, key="invoice_net_terms")
+            due = ic2[2].date_input("Invoice Date", value=None, key="inv_due")
+            hrs_ded = ic2[3].number_input("Hours deducted", value=0.0, step=0.5, format="%.1f", key="invoice_hours_deducted")
             ic3 = st.columns(2)
-            sent = ic3[0].checkbox("Sent", value=default_sent, key="inv_sent")
-            paid = ic3[1].checkbox("Paid", value=default_paid, key="inv_paid")
+            sent = ic3[0].checkbox("Sent", value=False, key="inv_sent")
+            paid = ic3[1].checkbox("Paid", value=False, key="inv_paid")
 
-            submit_invoice = st.form_submit_button(
-                "💾 Save Invoice Changes" if action_mode == "Edit Existing" else "💾 Save Invoice"
-            )
-            if submit_invoice:
+            if st.form_submit_button("💾 Save Invoice"):
                 if not num_field:
                     st.error("Number is required.")
-                elif action_mode == "Edit Existing" and edit_rec is not None:
-                    edit_rec["number"] = num_field
-                    edit_rec["project"] = proj
-                    edit_rec["description"] = desc
-                    edit_rec["amount"] = round(amt, 2)
-                    edit_rec["net_terms"] = net
-                    edit_rec["due_date"] = str(due) if due else ""
-                    edit_rec["hours_deducted"] = hrs_ded if hrs_ded else ""
-                    edit_rec["sent"] = sent
-                    edit_rec["paid"] = paid
-                    save()
-                    st.success("Invoice updated!")
-                    st.rerun()
                 else:
                     D()["invoices"].append({
                         "type": "Invoice", "number": num_field, "project": proj,
                         "description": desc, "amount": round(amt, 2),
-                        "net_terms": net, "due_date": str(due) if due else "",
+                        "net_terms": net, "due_date": _date_to_str(due),
                         "hours_deducted": hrs_ded if hrs_ded else "",
                         "sent": sent, "paid": paid,
                     })
                     save()
                     st.rerun()
-
         else:
-            if action_mode == "Edit Existing" and edit_inst is not None:
-                default_amt = float(edit_inst.get("amount", 0))
-                default_net = edit_inst.get("net_terms", "Net 30")
-                default_due = parse_date(edit_inst.get("due_date", ""))
-                default_sent = bool(edit_inst.get("sent", False))
-                default_paid = bool(edit_inst.get("paid", False))
+            st.markdown("**Add installments below, then click Save Work Order.**")
+            if "wo_installments" not in st.session_state:
+                st.session_state.wo_installments = []
+            ic2 = st.columns(3)
+            inst_amt = ic2[0].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="wo_new_amount")
+            inst_net = ic2[1].selectbox("Net Terms", NET_OPTIONS, key="wo_new_net_terms")
+            inst_due = ic2[2].date_input("Invoice Date", value=None, key="wo_new_invoice_date")
+            add_inst = st.form_submit_button("➕ Add Installment")
+            save_wo = st.form_submit_button("💾 Save Work Order")
 
-                net_options = ["Net 30", "Net 60", "Net 90", "Net 120"]
-                net_index = net_options.index(default_net) if default_net in net_options else 0
+            if add_inst:
+                if not desc:
+                    st.error("Period / Label is required before adding an installment.")
+                elif inst_amt <= 0:
+                    st.error("Installment amount must be greater than $0.")
+                else:
+                    st.session_state.wo_installments.append({
+                        "period": desc, "amount": round(inst_amt, 2),
+                        "net_terms": inst_net, "due_date": _date_to_str(inst_due),
+                        "sent": False, "paid": False,
+                    })
+                    st.success("Installment added. Add another or save the work order.")
+                    st.rerun()
 
-                ic2 = st.columns(4)
-                inst_amt = ic2[0].number_input("Amount ($)", value=default_amt, step=1.0, format="%.2f", key="wo_edit_amount")
-                inst_net = ic2[1].selectbox("Net Terms", net_options, index=net_index, key="wo_edit_net_terms")
-                inst_due = ic2[2].date_input("Invoice Date", value=default_due, key="wo_edit_invoice_date")
-                ic3 = st.columns(2)
-                inst_sent = ic3[0].checkbox("Sent", value=default_sent, key="wo_sent")
-                inst_paid = ic3[1].checkbox("Paid", value=default_paid, key="wo_paid")
-
-                save_wo_edit = st.form_submit_button("💾 Save Work Order Changes")
-                if save_wo_edit:
-                    if not num_field:
-                        st.error("Number is required.")
-                    else:
-                        edit_rec["number"] = num_field
-                        edit_rec["project"] = proj
-                        edit_rec["description"] = edit_rec.get("description", "")
-                        edit_inst["period"] = desc
-                        edit_inst["amount"] = round(inst_amt, 2)
-                        edit_inst["net_terms"] = inst_net
-                        edit_inst["due_date"] = str(inst_due) if inst_due else ""
-                        edit_inst["sent"] = inst_sent
-                        edit_inst["paid"] = inst_paid
-                        save()
-                        st.success("Work order installment updated!")
-                        st.rerun()
-            else:
-                st.markdown("**Add installments below, then click Save Work Order.**")
-                if "wo_installments" not in st.session_state:
+            if save_wo and num_field:
+                if st.session_state.wo_installments:
+                    D()["invoices"].append({
+                        "type": "Work Order", "number": num_field, "project": proj,
+                        "description": num_field,
+                        "installments": list(st.session_state.wo_installments),
+                    })
+                    wo_t = sum(i["amount"] for i in st.session_state.wo_installments)
+                    contracted = project_contracted_total(D()["project_records"].get(proj, {}))
+                    save()
                     st.session_state.wo_installments = []
+                    if abs(wo_t - contracted) > 0.01 and (wo_t > 0 or contracted > 0):
+                        st.warning(f"⚠️ WO total ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f}")
+                    st.rerun()
+                else:
+                    st.error("Add at least one installment.")
+            elif save_wo and not num_field:
+                st.error("Number is required.")
 
-                # Use the main Work Order "Period / Label" box above as the installment label.
-                # This avoids duplicate Period widgets and makes Add Installment behave reliably.
-                ic2 = st.columns(3)
-                inst_amt = ic2[0].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="wo_new_amount")
-                inst_net = ic2[1].selectbox("Net Terms", ["Net 30", "Net 60", "Net 90", "Net 120"], key="wo_new_net_terms")
-                inst_due = ic2[2].date_input("Invoice Date", value=None, key="wo_new_invoice_date")
-                add_inst = st.form_submit_button("➕ Add Installment")
-                save_wo = st.form_submit_button("💾 Save Work Order")
-
-                if add_inst:
-                    if not desc:
-                        st.error("Period / Label is required before adding an installment.")
-                    elif inst_amt <= 0:
-                        st.error("Installment amount must be greater than $0.")
-                    else:
-                        st.session_state.wo_installments.append({
-                            "period": desc, "amount": round(inst_amt, 2),
-                            "net_terms": inst_net,
-                            "due_date": str(inst_due) if inst_due else "",
-                            "sent": False, "paid": False,
-                        })
-                        st.success("Installment added. Add another installment or save the work order.")
-                        st.rerun()
-
-                if save_wo and num_field:
-                    if st.session_state.wo_installments:
-                        D()["invoices"].append({
-                            "type": "Work Order", "number": num_field, "project": proj,
-                            "description": num_field,
-                            "installments": list(st.session_state.wo_installments),
-                        })
-                        wo_t = sum(i["amount"] for i in st.session_state.wo_installments)
-                        contracted = project_contracted_total(D()["project_records"].get(proj, {}))
-                        save()
-                        st.session_state.wo_installments = []
-                        if abs(wo_t - contracted) > 0.01 and (wo_t > 0 or contracted > 0):
-                            st.warning(f"⚠️ WO total ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f}")
-                        st.rerun()
-                    else:
-                        st.error("Add at least one installment.")
-                elif save_wo and not num_field:
-                    st.error("Number is required.")
-
-    # Show staged installments
-    if form_type == "Work Order" and action_mode == "Add New" and st.session_state.get("wo_installments"):
+    # Staged installments preview (for a new Work Order)
+    if form_type == "Work Order" and st.session_state.get("wo_installments"):
         st.markdown("**Staged installments:**")
-        inst_df = pd.DataFrame(st.session_state.wo_installments)
-        st.dataframe(inst_df, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(st.session_state.wo_installments),
+                     use_container_width=True, hide_index=True)
         total = sum(i["amount"] for i in st.session_state.wo_installments)
         st.markdown(f"**Total: ${total:,.2f}**")
         if st.button("Clear installments"):
             st.session_state.wo_installments = []
             st.rerun()
 
-    # Display table
+    # ══════════════════════════════════════════════════════════════════
+    # ALL RECORDS  (edit inline, then confirm before changes are written)
+    # ══════════════════════════════════════════════════════════════════
     st.subheader("All Records")
-    flat = flat_invoice_rows(D(), show_hist=show_hist, proj_filter=proj_filter)
-    if flat:
-        display_rows = []
-        for r in flat:
-            display_rows.append({
-                "Type": r["type"], "Number": r["number"],
-                "Project": r["project"], "Description": r["description"],
-                "Inst. Amount": f"${r['inst_amount']:,.2f}",
-                "WO Total": f"${r['wo_total']:,.2f}" if r["type"] == "Work Order" else "",
-                "Terms": r["net_terms"],
-                "Invoice Date": fmt_date(r["due_date"]),
-                "Payment Due": fmt_date(r["payment_due"]),
-                "Hours Deducted": r.get("hours_deducted", "") if r["type"] == "Invoice" else "",
-                "Sent": "☑" if r["sent"] else "☐",
-                "Paid": "☑" if r["paid"] else "☐",
-            })
-        event = st.dataframe(
-            pd.DataFrame(display_rows), use_container_width=True, hide_index=True,
-            on_select="rerun", selection_mode="single-row", key="invoice_table",
+    st.caption("Edit any cell directly in the table below — including the **Delete** "
+               "box to remove a row — then click **Review changes**. Nothing is saved "
+               "until you confirm. **Payment Due** and **WO Total** are computed.")
+
+    if "inv_editor_gen" not in st.session_state:
+        st.session_state.inv_editor_gen = 0
+    if "inv_pending" not in st.session_state:
+        st.session_state.inv_pending = False
+
+    flat = flat_invoice_rows(D(), proj_filter=proj_filter)
+    if not flat:
+        st.info("No records yet. Add an invoice or work order above.")
+    else:
+        edit_df = pd.DataFrame([{
+            "Type": r["type"],
+            "Number": str(r["number"]),
+            "Project": r["project"],
+            "Description": r["description"],
+            "Amount": float(r["inst_amount"]),
+            "Net Terms": r["net_terms"] if r["net_terms"] in NET_OPTIONS else "Net 30",
+            "Invoice Date": parse_date(r["due_date"]),
+            "Hours Deducted": float(r["hours_deducted"]) if (r["type"] == "Invoice" and r.get("hours_deducted") not in ("", None)) else 0.0,
+            "Sent": bool(r["sent"]),
+            "Paid": bool(r["paid"]),
+            "Payment Due": fmt_date(r["payment_due"]),
+            "WO Total": f"${r['wo_total']:,.2f}" if r["type"] == "Work Order" else "",
+            "Delete": False,
+        } for r in flat])
+
+        money_col = st.column_config.NumberColumn(min_value=0.0, step=1.0, format="$%.2f")
+        edited = st.data_editor(
+            edit_df, use_container_width=True, hide_index=True, num_rows="fixed",
+            key=f"inv_editor_{st.session_state.inv_editor_gen}",
+            column_config={
+                "Type": st.column_config.TextColumn(disabled=True, width="small"),
+                "Number": st.column_config.TextColumn(required=True),
+                "Project": st.column_config.SelectboxColumn(options=projects_sorted(), required=True),
+                "Description": st.column_config.TextColumn(),
+                "Amount": money_col,
+                "Net Terms": st.column_config.SelectboxColumn(options=NET_OPTIONS),
+                "Invoice Date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                "Hours Deducted": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f"),
+                "Sent": st.column_config.CheckboxColumn(),
+                "Paid": st.column_config.CheckboxColumn(),
+                "Payment Due": st.column_config.TextColumn(disabled=True),
+                "WO Total": st.column_config.TextColumn(disabled=True),
+                "Delete": st.column_config.CheckboxColumn(help="Tick to remove this row on save"),
+            },
         )
 
-        # Quick actions on the selected row (click a row above)
-        st.subheader("Quick Actions")
-        sel = event.selection.rows
-        if sel and sel[0] < len(flat):
-            r = flat[sel[0]]
-            st.caption(f"Selected: {r['type']} #{r['number']} — {r['project']} — ${r['inst_amount']:,.2f}")
-            qc1, qc2, qc3 = st.columns([1, 1, 1])
-            tg_field = qc1.selectbox("Toggle field", ["sent", "paid"], key="inv_toggle_field")
-            if qc2.button("Toggle ☐ ↔ ☑"):
-                if r["_inst"] is not None:
-                    r["_inst"][tg_field] = not r["_inst"][tg_field]
-                else:
-                    r["_rec"][tg_field] = not r["_rec"][tg_field]
-                save()
-                st.rerun()
-            if qc3.button("🗑️ Delete Selected"):
-                rec = r["_rec"]
-                if r["_inst"] is not None:
-                    # WO installment — remove just this installment
-                    rec.get("installments", []).remove(r["_inst"])
-                    # If no installments left, remove the whole WO
-                    if not rec.get("installments"):
-                        D()["invoices"].remove(rec)
-                else:
-                    # Invoice — remove the whole record
-                    D()["invoices"].remove(rec)
-                save()
+        # ── Confirm-before-write gate ──
+        if not st.session_state.inv_pending:
+            if st.button("📝 Review changes"):
+                st.session_state.inv_pending = True
                 st.rerun()
         else:
-            st.caption("Click a row above to toggle Sent/Paid or delete it.")
+            n_del = int(edited["Delete"].sum()) if "Delete" in edited else 0
+            warn = "Are you sure you want to apply these changes?"
+            if n_del:
+                warn += f" This will also delete {n_del} row{'s' if n_del != 1 else ''}."
+            st.warning(warn)
+            cc1, cc2, _ = st.columns([1, 1, 3])
+            if cc1.button("✅ Yes, apply changes"):
+                # 1. Write edits back to every non-deleted row (object references
+                #    in flat[i] keep us aligned to the underlying records).
+                for i in range(len(flat)):
+                    row = edited.iloc[i]
+                    if bool(row.get("Delete")):
+                        continue
+                    rec = flat[i]["_rec"]
+                    inst = flat[i]["_inst"]
+                    rec["number"] = str(row["Number"]).strip()
+                    rec["project"] = row["Project"]
+                    if flat[i]["type"] == "Invoice":
+                        rec["description"] = row["Description"]
+                        rec["amount"] = round(num(row["Amount"]), 2)
+                        rec["net_terms"] = row["Net Terms"]
+                        rec["due_date"] = _date_to_str(row["Invoice Date"])
+                        hd = num(row["Hours Deducted"])
+                        rec["hours_deducted"] = hd if hd else ""
+                        rec["sent"] = bool(row["Sent"])
+                        rec["paid"] = bool(row["Paid"])
+                    else:  # Work Order installment
+                        inst["period"] = row["Description"]
+                        inst["amount"] = round(num(row["Amount"]), 2)
+                        inst["net_terms"] = row["Net Terms"]
+                        inst["due_date"] = _date_to_str(row["Invoice Date"])
+                        inst["sent"] = bool(row["Sent"])
+                        inst["paid"] = bool(row["Paid"])
+                # 2. Process deletions (installment → drop it; empty WO or invoice
+                #    → drop the whole record).
+                for i in range(len(flat)):
+                    if not bool(edited.iloc[i].get("Delete")):
+                        continue
+                    rec = flat[i]["_rec"]
+                    inst = flat[i]["_inst"]
+                    if inst is not None:
+                        if inst in rec.get("installments", []):
+                            rec["installments"].remove(inst)
+                        if not rec.get("installments") and rec in D()["invoices"]:
+                            D()["invoices"].remove(rec)
+                    elif rec in D()["invoices"]:
+                        D()["invoices"].remove(rec)
+                save()
+                st.session_state.inv_pending = False
+                st.session_state.inv_editor_gen += 1  # remount editor fresh
+                st.toast("Changes saved")
+                st.rerun()
+            if cc2.button("✖ Cancel"):
+                st.session_state.inv_pending = False
+                st.session_state.inv_editor_gen += 1  # discard in-grid edits
+                st.rerun()
 
-        # CSV export
-        csv = pd.DataFrame(display_rows).to_csv(index=False)
+        # CSV export (reflects what's currently saved)
+        export_rows = [{
+            "Type": r["type"], "Number": r["number"], "Project": r["project"],
+            "Description": r["description"], "Inst. Amount": r["inst_amount"],
+            "WO Total": r["wo_total"] if r["type"] == "Work Order" else "",
+            "Terms": r["net_terms"], "Invoice Date": fmt_date(r["due_date"]),
+            "Payment Due": fmt_date(r["payment_due"]),
+            "Hours Deducted": r.get("hours_deducted", "") if r["type"] == "Invoice" else "",
+            "Sent": "Yes" if r["sent"] else "No", "Paid": "Yes" if r["paid"] else "No",
+        } for r in flat]
+        csv = pd.DataFrame(export_rows).to_csv(index=False)
         st.download_button("⬇️ Export CSV", csv, "invoices_wo.csv", "text/csv")
 
 
@@ -1370,18 +1413,24 @@ elif page == "Tools":
     # Tools active in the selected FY, keeping their original index for edit/delete.
     filtered = [(i, t) for i, t in enumerate(tools) if tool_in_fy(t, tool_fy)]
 
-    # KPIs (scoped to the selected FY)
-    total_m = total_a = 0.0
+    # KPIs (scoped to the selected FY): split tools into monthly vs one-time.
+    monthly_sum = onetime_sum = 0.0
     for _, t in filtered:
-        mc, ac = calc_tool_costs(t)
-        total_m += mc; total_a += ac
-    mc1, mc2, mc3 = st.columns(3)
+        cost = float(t.get("cost", 0) or 0)
+        if t.get("billing_cycle") == "Monthly":
+            monthly_sum += cost
+        else:
+            onetime_sum += cost
+    total_cost = monthly_sum * 12 + onetime_sum
+    mc1, mc2, mc3, mc4 = st.columns(4)
     mc1.metric("Tools", len(filtered))
-    mc2.metric("Monthly Total", f"${total_m:,.2f}")
-    mc3.metric("Annual Total", f"${total_a:,.2f}")
+    mc2.metric("Total Tools Cost", f"${total_cost:,.2f}")
+    mc3.metric("Monthly Cost", f"${monthly_sum:,.2f}")
+    mc4.metric("One-time Cost", f"${onetime_sum:,.2f}")
     if tool_fy != "All":
         st.caption(f"Showing tools active in {tool_fy} "
                    "(a tool with no end date counts as ongoing from its start).")
+    st.caption("Total = monthly tools × 12 + one-time tools × 1.")
 
     # Add / Edit tool using the same input form style
     st.subheader("Add / Edit Tool")
@@ -1403,7 +1452,7 @@ elif page == "Tools":
         else:
             st.info("No tools available to edit yet.")
 
-    cycle_options = ["Monthly", "Annual", "2-Year", "One-time"]
+    cycle_options = ["Monthly", "One-time"]
     current_cycle = selected_tool.get("billing_cycle", "Monthly")
     cycle_index = cycle_options.index(current_cycle) if current_cycle in cycle_options else 0
 
@@ -1477,7 +1526,7 @@ elif page == "Tools":
                 "Vendor": t.get("vendor", ""),
                 "Cost": f"${t.get('cost', 0):,.2f}",
                 "Cycle": t.get("billing_cycle", ""),
-                "Monthly": f"${mc:,.2f}",
+                "Monthly": f"${mc:,.2f}" if t.get("billing_cycle") == "Monthly" else "—",
                 "Annual": f"${ac:,.2f}",
                 "Used by": f"{n_users}" if n_users else "—",
                 "Per project / yr": per_proj,
@@ -1618,8 +1667,7 @@ elif page == "Results":
                     budget += fy_budget_available(proj, fy_year)
                 else:
                     budget += fy_total_budget_added(proj)
-            credits += sum(s["credits"] for s in D()["student_credits"]
-                           if s["project"] == name)
+            credits += project_credits(D(), fy, name)
         sw_count = sw_count_for_fy(fy)
         return {"Student Workers": sw_count, "Projects": proj_count,
                 "Budget": budget, "Credits": credits}

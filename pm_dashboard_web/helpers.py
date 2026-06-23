@@ -61,12 +61,12 @@ def calc_renewal_date(tool: dict) -> str:
 
 
 def calc_tool_costs(tool: dict) -> tuple:
+    """Return (monthly_cost, annual_cost) under the two-cycle model:
+    Monthly tools recur monthly (annual = cost*12); One-time tools are paid
+    once a year (no monthly component, annual = cost)."""
     cost = float(tool.get("cost", 0))
     cycle = tool.get("billing_cycle", "Monthly")
     if cycle == "Monthly":
         return cost, cost * 12
-    elif cycle == "Annual":
-        return round(cost / 12, 2), cost
-    elif cycle == "2-Year":
-        return round(cost / 24, 2), round(cost / 2, 2)
-    return 0.0, 0.0
+    # One-time / once-a-year
+    return 0.0, cost

@@ -57,7 +57,7 @@ def blank_project(code, name, has_budget=False):
         "code": code, "has_budget": has_budget,
         "status": "Active",
         "start_date": "", "end_date": "", "extension_date": "",
-        "notes": "", "hours_budget": 0.0, "hours_log": [],
+        "notes": "", "notes_by_fy": {}, "hours_budget": 0.0, "hours_log": [],
         "contracted_hours": 0.0,
         "contracted_hours_by_fy": {},
         "fy_funding": {},
@@ -222,14 +222,52 @@ def _normalize(data: dict) -> dict:
             except Exception:
                 fixed[label] = rec
         data["student_workers"] = fixed
+
+    # Per-FY student credits. Migrate an old flat list into a fiscal-year bucket
+    # (the current FY), then re-key everything to the canonical label and keep a
+    # flattened "student_credits" view so whole-dataset totals keep working.
+    scbf = data.get("student_credits_by_fy")
+    if not isinstance(scbf, dict):
+        flat = data.get("student_credits", []) or []
+        scbf = {fy_label(date_to_fy(date.today())): flat} if flat else {}
+    fixed_c = {}
+    for label, recs in scbf.items():
+        try:
+            y = int(str(label).split()[1].split("-")[0])
+            fixed_c[fy_label(y)] = recs or []
+        except Exception:
+            fixed_c[label] = recs or []
+    data["student_credits_by_fy"] = fixed_c
+    data["student_credits"] = [r for recs in fixed_c.values() for r in recs]
+
+    # Tools: collapse the old cycles (Annual/2-Year/anything) into the
+    # two-cycle model. Only "Monthly" stays monthly; everything else is one-time.
+    for t in data.get("tools", []) or []:
+        if t.get("billing_cycle") != "Monthly":
+            t["billing_cycle"] = "One-time"
+
     pr = data.get("project_records", {})
     for proj in pr.values():
-        for key, default in [("notes",""), ("start_date",""), ("end_date",""),
+        for key, default in [("notes",""), ("notes_by_fy",{}),
+                              ("start_date",""), ("end_date",""),
                               ("extension_date",""), ("hours_budget",0.0),
                               ("hours_log",[]), ("assigned_tools",[]),
                               ("status","Active"), ("fy_funding",{}),
                               ("lines_by_fy",{}), ("contracted_hours_by_fy",{})]:
             proj.setdefault(key, default)
+        # Per-FY notes: keys are FY years as strings ({"2026": "..."}). The legacy
+        # project-level "notes" string is preserved untouched and acts as the
+        # fallback shown for any FY that has no note of its own (see
+        # project_note_for_fy). Re-key any non-canonical year keys to plain "YYYY".
+        nbf = proj.get("notes_by_fy")
+        if isinstance(nbf, dict) and nbf:
+            fixed_n = {}
+            for k, v in nbf.items():
+                try:
+                    fixed_n[str(int(str(k).split()[1].split("-")[0]))] = v
+                except Exception:
+                    fixed_n[str(k)] = v
+            proj["notes_by_fy"] = fixed_n
         # Migrate old Hours-tab project-level budget into the new contracted_hours field.
         if "contracted_hours" not in proj:
             proj["contracted_hours"] = float(proj.get("hours_budget", 0.0))
@@ -416,6 +454,24 @@ def project_primary_fy(proj: dict) -> int:
         if d:
             return date_to_fy(d)
     return date_to_fy(date.today())
+
+
+def project_note_for_fy(proj: dict, year) -> str:
+    """Note text for one fiscal year. A FY that has its own saved note (even an
+    empty string) uses it; otherwise we fall back to the legacy project-level
+    'notes' so existing notes keep showing until a FY-specific note is saved."""
+    nbf = proj.get("notes_by_fy") or {}
+    key = str(year)
+    if key in nbf:
+        return nbf[key] or ""
+    return proj.get("notes", "") or ""
+
+
+def set_project_note_for_fy(proj: dict, year, text: str):
+    """Save a note for one fiscal year. The value is stored even when blank, so
+    clearing a FY's note overrides the legacy fallback rather than re-showing it."""
+    nbf = proj.setdefault("notes_by_fy", {})
+    nbf[str(year)] = text or ""
 
 
 def lines_by_fy(proj: dict) -> dict:
@@ -852,6 +908,45 @@ def tool_in_fy(tool: dict, label: str) -> bool:
     if t_end is None:
         return True
     return t_end >= fy_s
+
+
+def _fy_year_of(label) -> int:
+    try:
+        return int(str(label).split()[1].split("-")[0])
+    except Exception:
+        return None
+
+
+def credits_for_fy(data: dict, label: str) -> list:
+    """Credit records for a fiscal year (matched by year so label format doesn't
+    matter). 'All' returns every FY's records combined."""
+    scbf = data.get("student_credits_by_fy", {}) or {}
+    if label == "All":
+        return [r for recs in scbf.values() for r in recs]
+    target = _fy_year_of(label)
+    out = []
+    for key, recs in scbf.items():
+        if _fy_year_of(key) == target:
+            out.extend(recs or [])
+    return out
+
+
+def project_credits(data: dict, label: str, project: str) -> float:
+    return sum(float(r.get("credits", 0) or 0)
+               for r in credits_for_fy(data, label) if r.get("project") == project)
+
+
+def set_credits_for_fy(data: dict, label: str, records: list):
+    """Replace one fiscal year's credit records (stored under the canonical
+    label) and keep the flattened student_credits view in sync."""
+    scbf = data.setdefault("student_credits_by_fy", {})
+    y = _fy_year_of(label)
+    key = fy_label(y) if y is not None else label
+    for k in list(scbf.keys()):
+        if _fy_year_of(k) == y:
+            del scbf[k]
+    scbf[key] = records
+    data["student_credits"] = [r for recs in scbf.values() for r in recs]
 
 
 # ─── Overview KPIs (predefined, user-selectable) ──────────────────────────
