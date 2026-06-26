@@ -3,6 +3,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import json
+import base64
+from pathlib import Path
 from datetime import date
 from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
                      calc_payment_due, calc_renewal_date, calc_tool_costs)
@@ -32,7 +34,37 @@ def D():
     return st.session_state.data
 
 
+# ─── Accounts / roles ────────────────────────────────────────────────────
+# Two accounts: a privileged editor and a read-only viewer. Passwords are read
+# from Streamlit secrets ([auth] editor_password / viewer_password) when set,
+# otherwise these defaults apply — change them in secrets for real security.
+ACCOUNTS = {"Privileged (full access)": "editor", "View only": "viewer"}
+
+
+def _account_pw(secret_key: str, default: str) -> str:
+    try:
+        return str(st.secrets["auth"][secret_key])
+    except Exception:
+        return default
+
+
+_PASSWORDS = {
+    "editor": _account_pw("editor_password", "pm-admin"),
+    "viewer": _account_pw("viewer_password", "pm-view"),
+}
+
+
+def can_edit() -> bool:
+    """True only for the privileged account — gates every write."""
+    return st.session_state.get("role") == "editor"
+
+
 def save():
+    # Hard backstop: a view-only account can never persist changes, even if a
+    # control were ever shown to it by mistake.
+    if not can_edit():
+        st.toast("👁️ View-only account — changes are not saved.", icon="👁️")
+        return
     ok = save_data(D())
     if ok is False:
         st.toast("⚠️ Cloud save failed — saved locally only. "
@@ -263,6 +295,90 @@ NAV_ITEMS = [
 if "page" not in st.session_state:
     st.session_state.page = "Overview"
 
+
+# ─── Login gate (centered, shown before the app shell) ───────────────────
+def _login_bg():
+    """Find the login background image next to this script (PNG or JPG) and
+    return (base64_data, mime_type), or (None, None) if none is found."""
+    names = ("CIRATLogo.png", "CIRATLogo.jpg", "CIRATLogo.jpeg",
+             "login-bg.png", "login-bg.jpg", "login_bg.png", "login_bg.jpg")
+    for name in names:
+        p = Path(__file__).parent / name
+        if p.exists():
+            try:
+                data = base64.b64encode(p.read_bytes()).decode("ascii")
+                mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+                return data, mime
+            except Exception:
+                return None, None
+    return None, None
+
+
+def _inject_login_style():
+    """Full-screen background image for the login page + a translucent,
+    still-legible (frosted-glass) login card. Login screen only.
+
+    Uses background-size: contain so the WHOLE image shows the same way on
+    any monitor resolution (no resolution-dependent cropping). To change the
+    picture, replace the image file in this folder. PNG or JPG both work; the
+    name can be CIRATLogo / login-bg / login_bg with a .png or .jpg ending."""
+    b64, mime = _login_bg()
+    st.markdown(f"""
+    <style>
+      [data-testid="stAppViewContainer"] {{
+          background-color: #0f172a;
+          {f'background-image: url("data:{mime};base64,{b64}");' if b64 else
+            'background-image: linear-gradient(135deg, #0f172a, #1e293b);'}
+          background-size: auto 100%;        /* full height shown; width scales */
+          background-position: center;
+          background-repeat: no-repeat;
+          background-attachment: fixed;
+      }}
+      [data-testid="stHeader"] {{ background: rgba(0,0,0,0); }}
+      /* The login form becomes a translucent frosted card */
+      [data-testid="stForm"] {{
+          background: rgba(15, 23, 42, 0.45);
+          backdrop-filter: blur(10px);
+          -webkit-backdrop-filter: blur(10px);
+          border: 1px solid rgba(255,255,255,0.18);
+          border-radius: 16px;
+          padding: 22px 22px 8px;
+          box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+      }}
+      [data-testid="stForm"] label,
+      [data-testid="stForm"] p {{ color: #e2e8f0 !important; }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def _login_gate():
+    """Block the whole app behind a centered sign-in screen until a valid
+    account + password is entered. Returns once signed in."""
+    if st.session_state.get("role"):
+        return
+    _inject_login_style()
+    # Center a compact login card; nothing else renders until signed in.
+    st.markdown("<div style='height: 8vh;'></div>", unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 1.2, 1])
+    with mid:
+        with st.form("login_form"):
+            acct = st.selectbox("Account", list(ACCOUNTS.keys()), key="login_account")
+            pw = st.text_input("Password", type="password", key="login_pw")
+            ok = st.form_submit_button("Sign in", use_container_width=True,
+                                       type="primary")
+        if ok:
+            want = ACCOUNTS[acct]
+            if pw == _PASSWORDS[want]:
+                st.session_state["role"] = want
+                st.session_state.pop("login_pw", None)
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    st.stop()
+
+
+_login_gate()
+
 with st.sidebar:
     # Logo
     st.markdown("""
@@ -300,15 +416,23 @@ with st.sidebar:
     # Footer
     st.markdown('<hr style="border: none; border-top: 1px solid #1e293b; '
                 'margin: 16px 0 12px;">', unsafe_allow_html=True)
-    st.markdown("""
+
+    # ── Signed-in account + sign out (login happens on the centered gate) ──
+    role = st.session_state.get("role")
+    badge = "🔑 Privileged" if role == "editor" else "👁️ View only"
+    st.markdown(f"""
     <div style="display: flex; align-items: center; gap: 8px; padding: 4px;">
         <div style="width: 28px; height: 28px; border-radius: 50%;
                     background: rgba(52,211,153,0.15); display: flex;
                     align-items: center; justify-content: center;
                     font-size: 11px; font-weight: 500; color: #34d399 !important;">PM</div>
-        <span style="font-size: 12px; color: #475569 !important;">Project Manager</span>
+        <span style="font-size: 12px; color: #475569 !important;">{badge}</span>
     </div>
     """, unsafe_allow_html=True)
+    if st.button("Sign out", use_container_width=True, key="sign_out"):
+        st.session_state.pop("role", None)
+        st.session_state.pop("login_pw", None)
+        st.rerun()
 
     # Storage status + manual backup
     if gist_configured():
@@ -366,7 +490,7 @@ if page == "Overview":
         picked = st.multiselect("Visible KPIs (shown in this order)", all_labels,
                                 default=current_labels, key="kpi_picker")
         kc1, kc2 = st.columns([1, 1])
-        if kc1.button("💾 Save KPIs"):
+        if can_edit() and kc1.button("💾 Save KPIs"):
             if picked:
                 D()["overview_kpis"] = [label_to_key[l] for l in picked]
                 save()
@@ -374,7 +498,7 @@ if page == "Overview":
                 st.rerun()
             else:
                 st.error("Pick at least one KPI.")
-        if kc2.button("↩️ Reset to default"):
+        if can_edit() and kc2.button("↩️ Reset to default"):
             D()["overview_kpis"] = list(DEFAULT_KPIS)
             save()
             st.rerun()
@@ -447,7 +571,7 @@ if page == "Overview":
                     icon, cat, proj, details = note
                     a1, a2 = st.columns([0.86, 0.14])
                     a1.markdown(f"{icon} **{cat}** — {proj}  \n{details}")
-                    if a2.button("Clear", key=f"alert_clr_{_alert_sig(note)}"):
+                    if can_edit() and a2.button("Clear", key=f"alert_clr_{_alert_sig(note)}"):
                         D().setdefault("dismissed_alerts", []).append(_alert_sig(note))
                         st.session_state["alerts_open"] = True
                         save()
@@ -477,13 +601,13 @@ elif page == "Project View":
     with col1:
         active = st.selectbox("Active Project", projects, key="proj_select")
     with col2:
-        if st.button("➕ Add Project"):
+        if can_edit() and st.button("➕ Add Project"):
             st.session_state.show_add_project = True
     with col3:
-        if st.button("✏️ Edit Project"):
+        if can_edit() and st.button("✏️ Edit Project"):
             st.session_state.show_edit_project = True
     with col4:
-        if st.button("🗑️ Remove Project", type="secondary"):
+        if can_edit() and st.button("🗑️ Remove Project", type="secondary"):
             if len(projects) > 1:
                 st.session_state.confirm_del_proj = True
             else:
@@ -493,7 +617,7 @@ elif page == "Project View":
     if st.session_state.get("confirm_del_proj"):
         st.warning(f"Delete **{active}** and its student credits? This can't be undone.")
         dc1, dc2, _ = st.columns([1, 1, 4])
-        if dc1.button("Yes, delete", type="primary"):
+        if can_edit() and dc1.button("Yes, delete", type="primary"):
             del pr[active]
             scbf = D().setdefault("student_credits_by_fy", {})
             for k in list(scbf.keys()):
@@ -503,7 +627,7 @@ elif page == "Project View":
             save()
             st.toast(f"Removed {active}")
             st.rerun()
-        if dc2.button("Cancel"):
+        if can_edit() and dc2.button("Cancel"):
             st.session_state.confirm_del_proj = False
             st.rerun()
 
@@ -517,7 +641,7 @@ elif page == "Project View":
             new_start = ns.date_input("Start Date", value=None, key="new_start")
             new_end = ne.date_input("End Date", value=None, key="new_end")
             new_nb = st.checkbox("No Budget")
-            if st.button("Create Project"):
+            if can_edit() and st.button("Create Project"):
                 if new_code and new_name:
                     if new_name not in pr:
                         p = blank_project(new_code, new_name, new_nb)
@@ -544,7 +668,7 @@ elif page == "Project View":
             edit_name = en.text_input("Project Name", value=active,
                                       key=f"edit_name_{active}")
             eb1, eb2, _ = st.columns([1, 1, 3])
-            if eb1.button("💾 Save Changes", type="primary", key=f"edit_save_{active}"):
+            if can_edit() and eb1.button("💾 Save Changes", type="primary", key=f"edit_save_{active}"):
                 new_code = edit_code.strip()
                 new_name = edit_name.strip()
                 if not new_code or not new_name:
@@ -578,7 +702,7 @@ elif page == "Project View":
                     save()
                     st.toast(f"Saved {new_name}")
                     st.rerun()
-            if eb2.button("Cancel", key=f"edit_cancel_{active}"):
+            if can_edit() and eb2.button("Cancel", key=f"edit_cancel_{active}"):
                 st.session_state.show_edit_project = False
                 st.rerun()
 
@@ -599,7 +723,7 @@ elif page == "Project View":
     no_budget = dc4.checkbox("No Budget", value=proj.get("has_budget", False),
                              key=f"nb_chk_{active}")
     btn_c1, btn_c2, _ = st.columns([1, 1, 3])
-    if btn_c1.button("💾 Save Dates", key=f"save_dates_{active}"):
+    if can_edit() and btn_c1.button("💾 Save Dates", key=f"save_dates_{active}"):
         proj["start_date"] = str(sd) if sd else ""
         proj["end_date"] = str(ed) if ed else ""
         proj["extension_date"] = str(ext) if ext else ""
@@ -609,7 +733,7 @@ elif page == "Project View":
         st.toast("Dates saved")
         st.rerun()
     if proj.get("extension_date"):
-        if btn_c2.button("🗑️ Clear Extension", key=f"clear_ext_{active}"):
+        if can_edit() and btn_c2.button("🗑️ Clear Extension", key=f"clear_ext_{active}"):
             proj["extension_date"] = ""
             # reset the date widget so it shows empty again
             st.session_state.pop(f"proj_ext_{active}", None)
@@ -757,6 +881,7 @@ elif page == "Project View":
     edited = st.data_editor(
         edit_df, use_container_width=True, hide_index=True,
         num_rows="dynamic", key=f"lines_editor_{active}_{li_key}",
+        disabled=not can_edit(),
         column_config={
             "Line Item": st.column_config.TextColumn(required=True, width="medium"),
             "Students": st.column_config.NumberColumn(min_value=0, step=1),
@@ -767,7 +892,7 @@ elif page == "Project View":
         },
     )
 
-    if st.button("💾 Save Line Items", key=f"save_lines_{active}_{li_key}"):
+    if can_edit() and st.button("💾 Save Line Items", key=f"save_lines_{active}_{li_key}"):
         new_lines = [[
             (r["Line Item"] or "Untitled"),
             num(r["Students"], int), num(r["Stu Rate"]), num(r["Stu Hours"]),
@@ -827,7 +952,7 @@ elif page == "Project View":
     with hc2:
         if cin_h:
             st.caption(f"+ {cin_h:,.1f} hrs carried in from the prior FY.")
-    if st.button("💾 Save Contracted Hours", key=f"save_ch_{active}_{view_key}"):
+    if can_edit() and st.button("💾 Save Contracted Hours", key=f"save_ch_{active}_{view_key}"):
         if new_ch > 0:
             chf[view_key] = float(new_ch)
         else:
@@ -863,7 +988,7 @@ elif page == "Project View":
     if notes != cur_note:
         set_project_note_for_fy(proj, view_year, notes)
         save()
-    if st.button("💾 Save Notes", key=f"save_notes_{active}_{view_key}"):
+    if can_edit() and st.button("💾 Save Notes", key=f"save_notes_{active}_{view_key}"):
         set_project_note_for_fy(proj, view_year, notes)
         save()
         st.toast(f"Notes saved for {view_fy_label}")
@@ -876,7 +1001,7 @@ elif page == "Project View":
     with tc1:
         sel_tool = st.selectbox("Assign tool", [""] + [t for t in tool_names if t not in assigned])
     with tc2:
-        if st.button("Assign") and sel_tool:
+        if can_edit() and st.button("Assign") and sel_tool:
             assigned.append(sel_tool)
             proj["assigned_tools"] = assigned
             save()
@@ -948,18 +1073,18 @@ elif page == "Project View":
                     else:
                         st.caption(f"✓ Matches the {cycle.lower()} cost (${cost:,.2f})")
                     pc1, pc2 = st.columns(2)
-                    if pc1.button("💾 Save Split", key=f"pv_save_split_{active}_{pick}"):
+                    if can_edit() and pc1.button("💾 Save Split", key=f"pv_save_split_{active}_{pick}"):
                         t_sel["split_amounts"] = {p: float(v) for p, v in amt_inputs.items()}
                         save()
                         st.toast("Split saved")
                         st.rerun()
-                    if pc2.button("↩️ Reset to equal split", key=f"pv_reset_split_{active}_{pick}"):
+                    if can_edit() and pc2.button("↩️ Reset to equal split", key=f"pv_reset_split_{active}_{pick}"):
                         t_sel["split_amounts"] = {}
                         save()
                         st.rerun()
 
         rem_tool = st.selectbox("Remove tool", assigned, key="rem_tool")
-        if st.button("Remove Tool"):
+        if can_edit() and st.button("Remove Tool"):
             assigned.remove(rem_tool)
             save()
             st.rerun()
@@ -1146,14 +1271,15 @@ elif page == "Credits":
     D().setdefault("student_credits_by_fy", {})
     fy = st.selectbox("Fiscal Year", fy_choices(), key="cred_fy")
 
-    st.subheader("Load from Excel")
-    st.caption("Required columns: **Name, Student ID, Credits, Project** "
-               "(one row per student). Uploading replaces this fiscal year's credits.")
+    if can_edit():
+        st.subheader("Load from Excel")
+        st.caption("Required columns: **Name, Student ID, Credits, Project** "
+                   "(one row per student). Uploading replaces this fiscal year's credits.")
     nonce = st.session_state.get(f"cred_nonce_{fy}", 0)
     up = st.file_uploader(
         f"Drag an Excel (.xlsx) file here to load {fy} credits",
         type=["xlsx"], key=f"cred_upload_{fy}_{nonce}",
-    )
+    ) if can_edit() else None
     if up is not None:
         try:
             df_new = read_excel(up)
@@ -1163,7 +1289,7 @@ elif page == "Credits":
             else:
                 st.caption(f"Preview — {len(records)} students with a project")
                 st.dataframe(df_new, use_container_width=True, hide_index=True)
-                if st.button(f"💾 Save to {fy}", type="primary", key=f"cred_save_{fy}"):
+                if can_edit() and st.button(f"💾 Save to {fy}", type="primary", key=f"cred_save_{fy}"):
                     set_credits_for_fy(D(), fy, records)
                     save()
                     st.session_state[f"cred_nonce_{fy}"] = nonce + 1
@@ -1189,7 +1315,7 @@ elif page == "Credits":
     gen = st.session_state.get(f"cred_editor_gen_{fy}", 0)
     edited = st.data_editor(
         seed, use_container_width=True, hide_index=True, num_rows="dynamic",
-        key=f"cred_editor_{fy}_{gen}",
+        key=f"cred_editor_{fy}_{gen}", disabled=not can_edit(),
         column_config={
             "Name": st.column_config.TextColumn("Name"),
             "Student ID": st.column_config.TextColumn("Student ID"),
@@ -1198,7 +1324,7 @@ elif page == "Credits":
             "Project": st.column_config.TextColumn("Project"),
         },
     )
-    if st.button(f"💾 Save students to {fy}", type="primary", key=f"cred_manual_save_{fy}"):
+    if can_edit() and st.button(f"💾 Save students to {fy}", type="primary", key=f"cred_manual_save_{fy}"):
         records, err = parse_credit_rows(edited)
         if err:
             st.error(err)
@@ -1244,20 +1370,21 @@ elif page == "Student Workers":
 
     fy = st.selectbox("Fiscal Year for this table", fy_choices(), key="sw_fy")
 
-    st.subheader("Load from Excel")
+    if can_edit():
+        st.subheader("Load from Excel")
     # The uploader key carries a per-FY nonce so we can fully reset it (clear the
     # preview) after a save. Changing FY also changes the key → fresh empty box.
     nonce = st.session_state.get(f"sw_nonce_{fy}", 0)
     up = st.file_uploader(
         f"Drag an Excel (.xlsx) file here to load the {fy} student worker list",
         type=["xlsx"], key=f"sw_upload_{fy}_{nonce}",
-    )
+    ) if can_edit() else None
     if up is not None:
         try:
             df_new = read_excel(up)
             st.caption(f"Preview — {len(df_new)} rows, {len(df_new.columns)} columns")
             st.dataframe(df_new, use_container_width=True, hide_index=True)
-            if st.button(f"💾 Save to {fy}", type="primary", key=f"sw_save_{fy}"):
+            if can_edit() and st.button(f"💾 Save to {fy}", type="primary", key=f"sw_save_{fy}"):
                 sw[fy] = df_to_store(df_new)
                 save()
                 # Bump the nonce so the uploader resets and the preview disappears.
@@ -1274,15 +1401,15 @@ elif page == "Student Workers":
                    "remove rows, then Save Edits.")
         edited = st.data_editor(
             cur, use_container_width=True, hide_index=True,
-            num_rows="dynamic", key=f"sw_editor_{fy}",
+            num_rows="dynamic", key=f"sw_editor_{fy}", disabled=not can_edit(),
         )
         b1, b2, b3 = st.columns([1, 1, 2])
-        if b1.button("💾 Save Edits"):
+        if can_edit() and b1.button("💾 Save Edits"):
             sw[fy] = df_to_store(edited)
             save()
             st.toast("Saved")
             st.rerun()
-        if b2.button("🗑️ Clear Table"):
+        if can_edit() and b2.button("🗑️ Clear Table"):
             sw.pop(fy, None)
             save()
             st.rerun()
@@ -1322,84 +1449,85 @@ elif page == "Invoices / WO":
     # ══════════════════════════════════════════════════════════════════
     # ADD NEW  (input boxes only — editing happens inline in the table below)
     # ══════════════════════════════════════════════════════════════════
-    with st.form("add_inv"):
-        st.subheader(f"➕ Add {form_type}")
-        ic = st.columns(3)
-        project_options = projects_sorted()
-        num_field = ic[0].text_input("Number", value="", key="invwo_number")
-        proj = ic[1].selectbox("Project", project_options, key="invwo_project")
-        desc_label = "Period / Label" if form_type == "Work Order" else "Description"
-        desc = ic[2].text_input(desc_label, value="", key="invwo_description")
+    if can_edit():
+        with st.form("add_inv"):
+            st.subheader(f"➕ Add {form_type}")
+            ic = st.columns(3)
+            project_options = projects_sorted()
+            num_field = ic[0].text_input("Number", value="", key="invwo_number")
+            proj = ic[1].selectbox("Project", project_options, key="invwo_project")
+            desc_label = "Period / Label" if form_type == "Work Order" else "Description"
+            desc = ic[2].text_input(desc_label, value="", key="invwo_description")
 
-        if form_type == "Invoice":
-            ic2 = st.columns(4)
-            amt = ic2[0].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="invoice_amount")
-            net = ic2[1].selectbox("Net Terms", NET_OPTIONS, key="invoice_net_terms")
-            due = ic2[2].date_input("Invoice Date", value=None, key="inv_due")
-            hrs_ded = ic2[3].number_input("Hours deducted", value=0.0, step=0.5, format="%.1f", key="invoice_hours_deducted")
-            ic3 = st.columns(2)
-            sent = ic3[0].checkbox("Sent", value=False, key="inv_sent")
-            paid = ic3[1].checkbox("Paid", value=False, key="inv_paid")
+            if form_type == "Invoice":
+                ic2 = st.columns(4)
+                amt = ic2[0].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="invoice_amount")
+                net = ic2[1].selectbox("Net Terms", NET_OPTIONS, key="invoice_net_terms")
+                due = ic2[2].date_input("Invoice Date", value=None, key="inv_due")
+                hrs_ded = ic2[3].number_input("Hours deducted", value=0.0, step=0.5, format="%.1f", key="invoice_hours_deducted")
+                ic3 = st.columns(2)
+                sent = ic3[0].checkbox("Sent", value=False, key="inv_sent")
+                paid = ic3[1].checkbox("Paid", value=False, key="inv_paid")
 
-            if st.form_submit_button("💾 Save Invoice"):
-                if not num_field:
-                    st.error("Number is required.")
-                else:
-                    D()["invoices"].append({
-                        "type": "Invoice", "number": num_field, "project": proj,
-                        "description": desc, "amount": round(amt, 2),
-                        "net_terms": net, "due_date": _date_to_str(due),
-                        "hours_deducted": hrs_ded if hrs_ded else "",
-                        "sent": sent, "paid": paid,
-                    })
-                    save()
-                    st.toast("Invoice saved")
-                    st.rerun()
-        else:
-            st.markdown("**Add installments below, then click Save Work Order.**")
-            if "wo_installments" not in st.session_state:
-                st.session_state.wo_installments = []
-            ic2 = st.columns(3)
-            inst_amt = ic2[0].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="wo_new_amount")
-            inst_net = ic2[1].selectbox("Net Terms", NET_OPTIONS, key="wo_new_net_terms")
-            inst_due = ic2[2].date_input("Invoice Date", value=None, key="wo_new_invoice_date")
-            add_inst = st.form_submit_button("➕ Add Installment")
-            save_wo = st.form_submit_button("💾 Save Work Order")
-
-            if add_inst:
-                if not desc:
-                    st.error("Period / Label is required before adding an installment.")
-                elif inst_amt <= 0:
-                    st.error("Installment amount must be greater than $0.")
-                else:
-                    st.session_state.wo_installments.append({
-                        "period": desc, "amount": round(inst_amt, 2),
-                        "net_terms": inst_net, "due_date": _date_to_str(inst_due),
-                        "sent": False, "paid": False,
-                    })
-                    st.toast("Installment added — add another or save the work order.")
-                    st.rerun()
-
-            if save_wo and num_field:
-                if st.session_state.wo_installments:
-                    D()["invoices"].append({
-                        "type": "Work Order", "number": num_field, "project": proj,
-                        "description": num_field,
-                        "installments": list(st.session_state.wo_installments),
-                    })
-                    wo_t = sum(i["amount"] for i in st.session_state.wo_installments)
-                    contracted = project_contracted_total(D()["project_records"].get(proj, {}))
-                    save()
-                    st.session_state.wo_installments = []
-                    if abs(wo_t - contracted) > 0.01 and (wo_t > 0 or contracted > 0):
-                        st.toast(f"⚠️ WO total ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f}")
+                if st.form_submit_button("💾 Save Invoice"):
+                    if not num_field:
+                        st.error("Number is required.")
                     else:
-                        st.toast("Work order saved")
-                    st.rerun()
-                else:
-                    st.error("Add at least one installment.")
-            elif save_wo and not num_field:
-                st.error("Number is required.")
+                        D()["invoices"].append({
+                            "type": "Invoice", "number": num_field, "project": proj,
+                            "description": desc, "amount": round(amt, 2),
+                            "net_terms": net, "due_date": _date_to_str(due),
+                            "hours_deducted": hrs_ded if hrs_ded else "",
+                            "sent": sent, "paid": paid,
+                        })
+                        save()
+                        st.toast("Invoice saved")
+                        st.rerun()
+            else:
+                st.markdown("**Add installments below, then click Save Work Order.**")
+                if "wo_installments" not in st.session_state:
+                    st.session_state.wo_installments = []
+                ic2 = st.columns(3)
+                inst_amt = ic2[0].number_input("Amount ($)", value=0.0, step=1.0, format="%.2f", key="wo_new_amount")
+                inst_net = ic2[1].selectbox("Net Terms", NET_OPTIONS, key="wo_new_net_terms")
+                inst_due = ic2[2].date_input("Invoice Date", value=None, key="wo_new_invoice_date")
+                add_inst = st.form_submit_button("➕ Add Installment")
+                save_wo = st.form_submit_button("💾 Save Work Order")
+
+                if add_inst:
+                    if not desc:
+                        st.error("Period / Label is required before adding an installment.")
+                    elif inst_amt <= 0:
+                        st.error("Installment amount must be greater than $0.")
+                    else:
+                        st.session_state.wo_installments.append({
+                            "period": desc, "amount": round(inst_amt, 2),
+                            "net_terms": inst_net, "due_date": _date_to_str(inst_due),
+                            "sent": False, "paid": False,
+                        })
+                        st.toast("Installment added — add another or save the work order.")
+                        st.rerun()
+
+                if save_wo and num_field:
+                    if st.session_state.wo_installments:
+                        D()["invoices"].append({
+                            "type": "Work Order", "number": num_field, "project": proj,
+                            "description": num_field,
+                            "installments": list(st.session_state.wo_installments),
+                        })
+                        wo_t = sum(i["amount"] for i in st.session_state.wo_installments)
+                        contracted = project_contracted_total(D()["project_records"].get(proj, {}))
+                        save()
+                        st.session_state.wo_installments = []
+                        if abs(wo_t - contracted) > 0.01 and (wo_t > 0 or contracted > 0):
+                            st.toast(f"⚠️ WO total ${wo_t:,.2f} ≠ Contracted ${contracted:,.2f}")
+                        else:
+                            st.toast("Work order saved")
+                        st.rerun()
+                    else:
+                        st.error("Add at least one installment.")
+                elif save_wo and not num_field:
+                    st.error("Number is required.")
 
     # Staged installments preview (for a new Work Order)
     if form_type == "Work Order" and st.session_state.get("wo_installments"):
@@ -1408,7 +1536,7 @@ elif page == "Invoices / WO":
                      use_container_width=True, hide_index=True)
         total = sum(i["amount"] for i in st.session_state.wo_installments)
         st.markdown(f"**Total: ${total:,.2f}**")
-        if st.button("Clear installments"):
+        if can_edit() and st.button("Clear installments"):
             st.session_state.wo_installments = []
             st.rerun()
 
@@ -1451,6 +1579,7 @@ elif page == "Invoices / WO":
         edited = st.data_editor(
             edit_df, use_container_width=True, hide_index=True, num_rows="fixed",
             key=f"inv_editor_{st.session_state.inv_editor_gen}",
+            disabled=not can_edit(),
             column_config={
                 "Delete": st.column_config.CheckboxColumn("🗑️ Delete", help="Tick to remove this row on save", width="small"),
                 "Type": st.column_config.TextColumn(disabled=True, width="small"),
@@ -1470,7 +1599,7 @@ elif page == "Invoices / WO":
 
         # ── Confirm-before-write gate ──
         if not st.session_state.inv_pending:
-            if st.button("📝 Review changes"):
+            if can_edit() and st.button("📝 Review changes"):
                 st.session_state.inv_pending = True
                 st.rerun()
         else:
@@ -1480,7 +1609,7 @@ elif page == "Invoices / WO":
                 warn += f" This will also delete {n_del} row{'s' if n_del != 1 else ''}."
             st.warning(warn)
             cc1, cc2, _ = st.columns([1, 1, 3])
-            if cc1.button("✅ Yes, apply changes"):
+            if can_edit() and cc1.button("✅ Yes, apply changes"):
                 # 1. Write edits back to every non-deleted row (object references
                 #    in flat[i] keep us aligned to the underlying records).
                 for i in range(len(flat)):
@@ -1526,7 +1655,7 @@ elif page == "Invoices / WO":
                 st.session_state.inv_editor_gen += 1  # remount editor fresh
                 st.toast("Changes saved")
                 st.rerun()
-            if cc2.button("✖ Cancel"):
+            if can_edit() and cc2.button("✖ Cancel"):
                 st.session_state.inv_pending = False
                 st.session_state.inv_editor_gen += 1  # discard in-grid edits
                 st.rerun()
@@ -1594,94 +1723,95 @@ elif page == "Tools":
     st.caption("Total = monthly tools × 12 + one-time tools × 1.")
 
     # Add / Edit tool using the same input form style
-    st.subheader("Add / Edit Tool")
+    if can_edit():
+        st.subheader("Add / Edit Tool")
 
-    tool_mode = st.radio("Tool Action", ["Add New", "Edit Existing"],
-                         horizontal=True, key="tool_mode")
+        tool_mode = st.radio("Tool Action", ["Add New", "Edit Existing"],
+                             horizontal=True, key="tool_mode")
 
-    edit_tool_idx = None
-    selected_tool = {}
-    if tool_mode == "Edit Existing":
-        if tools:
-            edit_tool_idx = st.selectbox(
-                "Select tool to edit",
-                range(len(tools)),
-                format_func=lambda i: tools[i].get("name", f"Tool {i + 1}"),
-                key="edit_tool_idx"
-            )
-            selected_tool = tools[edit_tool_idx]
-        else:
-            st.info("No tools available to edit yet.")
-
-    cycle_options = ["Monthly", "One-time"]
-    current_cycle = selected_tool.get("billing_cycle", "Monthly")
-    cycle_index = cycle_options.index(current_cycle) if current_cycle in cycle_options else 0
-
-    # Generation counter: bumped after a successful save so the fields remount
-    # fresh (clears the Add New form; repopulates Edit from the selected tool).
-    gen = st.session_state.setdefault("tool_form_gen", 0)
-    kp = f"{tool_mode}_{edit_tool_idx}_{gen}"
-
-    with st.form("tool_form"):
-        tc = st.columns(3)
-        t_name = tc[0].text_input("Tool Name", value=selected_tool.get("name", ""),
-                                  key=f"tool_name_{kp}")
-        t_vendor = tc[1].text_input("Vendor", value=selected_tool.get("vendor", ""),
-                                    key=f"tool_vendor_{kp}")
-        t_cost = tc[2].number_input("Cost ($)",
-                                    value=float(selected_tool.get("cost", 0.0)),
-                                    min_value=0.0, step=1.0, format="%.2f",
-                                    key=f"tool_cost_{kp}")
-        tc2 = st.columns(4)
-        t_cycle = tc2[0].selectbox("Billing Cycle", cycle_options, index=cycle_index,
-                                   key=f"tool_cycle_{kp}")
-        t_start = tc2[1].date_input("Start Date",
-                                    value=parse_date(selected_tool.get("start_date", "")),
-                                    key=f"tool_start_{kp}")
-        t_end = tc2[2].date_input("End Date (blank = ongoing)",
-                                  value=parse_date(selected_tool.get("end_date", "")),
-                                  key=f"tool_end_{kp}")
-        t_renew = tc2[3].checkbox("Auto-renew", value=selected_tool.get("auto_renew", True),
-                                  key=f"tool_renew_{kp}")
-        tc3 = st.columns(4)
-        t_paid = tc3[0].checkbox("Paid", value=selected_tool.get("paid", False),
-                                 key=f"tool_paid_{kp}")
-        t_notes = st.text_input("Notes", value=selected_tool.get("notes", ""),
-                                key=f"tool_notes_{kp}")
-
-        submit_label = "💾 Save New Tool" if tool_mode == "Add New" else "💾 Update Tool"
-        if st.form_submit_button(submit_label):
-            if t_name:
-                tool_payload = {
-                    "name": t_name, "vendor": t_vendor,
-                    "cost": round(t_cost, 2),
-                    "billing_cycle": t_cycle,
-                    "start_date": str(t_start) if t_start else "",
-                    "end_date": str(t_end) if t_end else "",
-                    "auto_renew": t_renew, "paid": t_paid,
-                    "notes": t_notes,
-                }
-
-                if tool_mode == "Edit Existing" and edit_tool_idx is not None:
-                    old_name = tools[edit_tool_idx].get("name", "")
-                    tools[edit_tool_idx] = tool_payload
-
-                    # Keep project tool assignments synced if the tool name changes
-                    if old_name and old_name != t_name:
-                        for proj in D()["project_records"].values():
-                            proj["assigned_tools"] = [
-                                t_name if assigned_tool == old_name else assigned_tool
-                                for assigned_tool in proj.get("assigned_tools", [])
-                            ]
-                else:
-                    tools.append(tool_payload)
-
-                save()
-                # Remount the form fields fresh (clears inputs after saving).
-                st.session_state["tool_form_gen"] = gen + 1
-                st.rerun()
+        edit_tool_idx = None
+        selected_tool = {}
+        if tool_mode == "Edit Existing":
+            if tools:
+                edit_tool_idx = st.selectbox(
+                    "Select tool to edit",
+                    range(len(tools)),
+                    format_func=lambda i: tools[i].get("name", f"Tool {i + 1}"),
+                    key="edit_tool_idx"
+                )
+                selected_tool = tools[edit_tool_idx]
             else:
-                st.error("Tool name is required.")
+                st.info("No tools available to edit yet.")
+
+        cycle_options = ["Monthly", "One-time"]
+        current_cycle = selected_tool.get("billing_cycle", "Monthly")
+        cycle_index = cycle_options.index(current_cycle) if current_cycle in cycle_options else 0
+
+        # Generation counter: bumped after a successful save so the fields remount
+        # fresh (clears the Add New form; repopulates Edit from the selected tool).
+        gen = st.session_state.setdefault("tool_form_gen", 0)
+        kp = f"{tool_mode}_{edit_tool_idx}_{gen}"
+
+        with st.form("tool_form"):
+            tc = st.columns(3)
+            t_name = tc[0].text_input("Tool Name", value=selected_tool.get("name", ""),
+                                      key=f"tool_name_{kp}")
+            t_vendor = tc[1].text_input("Vendor", value=selected_tool.get("vendor", ""),
+                                        key=f"tool_vendor_{kp}")
+            t_cost = tc[2].number_input("Cost ($)",
+                                        value=float(selected_tool.get("cost", 0.0)),
+                                        min_value=0.0, step=1.0, format="%.2f",
+                                        key=f"tool_cost_{kp}")
+            tc2 = st.columns(4)
+            t_cycle = tc2[0].selectbox("Billing Cycle", cycle_options, index=cycle_index,
+                                       key=f"tool_cycle_{kp}")
+            t_start = tc2[1].date_input("Start Date",
+                                        value=parse_date(selected_tool.get("start_date", "")),
+                                        key=f"tool_start_{kp}")
+            t_end = tc2[2].date_input("End Date (blank = ongoing)",
+                                      value=parse_date(selected_tool.get("end_date", "")),
+                                      key=f"tool_end_{kp}")
+            t_renew = tc2[3].checkbox("Auto-renew", value=selected_tool.get("auto_renew", True),
+                                      key=f"tool_renew_{kp}")
+            tc3 = st.columns(4)
+            t_paid = tc3[0].checkbox("Paid", value=selected_tool.get("paid", False),
+                                     key=f"tool_paid_{kp}")
+            t_notes = st.text_input("Notes", value=selected_tool.get("notes", ""),
+                                    key=f"tool_notes_{kp}")
+
+            submit_label = "💾 Save New Tool" if tool_mode == "Add New" else "💾 Update Tool"
+            if st.form_submit_button(submit_label):
+                if t_name:
+                    tool_payload = {
+                        "name": t_name, "vendor": t_vendor,
+                        "cost": round(t_cost, 2),
+                        "billing_cycle": t_cycle,
+                        "start_date": str(t_start) if t_start else "",
+                        "end_date": str(t_end) if t_end else "",
+                        "auto_renew": t_renew, "paid": t_paid,
+                        "notes": t_notes,
+                    }
+
+                    if tool_mode == "Edit Existing" and edit_tool_idx is not None:
+                        old_name = tools[edit_tool_idx].get("name", "")
+                        tools[edit_tool_idx] = tool_payload
+
+                        # Keep project tool assignments synced if the tool name changes
+                        if old_name and old_name != t_name:
+                            for proj in D()["project_records"].values():
+                                proj["assigned_tools"] = [
+                                    t_name if assigned_tool == old_name else assigned_tool
+                                    for assigned_tool in proj.get("assigned_tools", [])
+                                ]
+                    else:
+                        tools.append(tool_payload)
+
+                    save()
+                    # Remount the form fields fresh (clears inputs after saving).
+                    st.session_state["tool_form_gen"] = gen + 1
+                    st.rerun()
+                else:
+                    st.error("Tool name is required.")
 
     if filtered:
         today = date.today()
@@ -1730,11 +1860,11 @@ elif page == "Tools":
             i = filtered[sel[0]][0]
             st.caption(f"Selected: **{tools[i].get('name', '')}**")
             b1, b2 = st.columns(2)
-            if b1.button("Toggle Paid ☐ ↔ ☑"):
+            if can_edit() and b1.button("Toggle Paid ☐ ↔ ☑"):
                 tools[i]["paid"] = not tools[i].get("paid", False)
                 save()
                 st.rerun()
-            if b2.button("🗑️ Delete Tool"):
+            if can_edit() and b2.button("🗑️ Delete Tool"):
                 st.session_state["confirm_del_tool"] = i
             # Reset a pending confirmation if a different row got selected.
             if (st.session_state.get("confirm_del_tool") is not None
@@ -1745,12 +1875,12 @@ elif page == "Tools":
                 st.warning(f"Remove **{tools[i].get('name', '')}**? "
                            "This can't be undone.")
                 cd1, cd2 = st.columns(2)
-                if cd1.button("✅ Yes, remove it", key=f"del_yes_{i}"):
+                if can_edit() and cd1.button("✅ Yes, remove it", key=f"del_yes_{i}"):
                     tools.pop(i)
                     st.session_state.pop("confirm_del_tool", None)
                     save()
                     st.rerun()
-                if cd2.button("↩️ Cancel", key=f"del_no_{i}"):
+                if can_edit() and cd2.button("↩️ Cancel", key=f"del_no_{i}"):
                     st.session_state.pop("confirm_del_tool", None)
                     st.rerun()
 
@@ -1791,12 +1921,12 @@ elif page == "Tools":
                 else:
                     st.caption(f"✓ Matches the {cycle.lower()} cost (${cost:,.2f})")
                 sc1, sc2 = st.columns(2)
-                if sc1.button("💾 Save Split", key=f"save_split_{i}"):
+                if can_edit() and sc1.button("💾 Save Split", key=f"save_split_{i}"):
                     t_sel["split_amounts"] = {p: float(v) for p, v in amt_inputs.items()}
                     save()
                     st.toast("Custom $ split saved")
                     st.rerun()
-                if sc2.button("↩️ Reset to equal split", key=f"reset_split_{i}"):
+                if can_edit() and sc2.button("↩️ Reset to equal split", key=f"reset_split_{i}"):
                     t_sel["split_amounts"] = {}
                     save()
                     st.rerun()
