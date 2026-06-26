@@ -418,13 +418,42 @@ if page == "Overview":
             st.info(f"No projects with contracted hours in {overview_fy}.")
 
     with col_right:
-        st.subheader("⚠️ Alerts")
         notifs = get_all_notifications(D())
-        if notifs:
-            df = pd.DataFrame(notifs, columns=["!", "Category", "Project", "Details"])
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            st.success("No alerts — all clear!")
+
+        # A stable signature per alert lets us remember which ones were cleared.
+        def _alert_sig(note):
+            return "‖".join(str(x) for x in note)
+
+        live_sigs = {_alert_sig(n) for n in notifs}
+        dismissed = D().get("dismissed_alerts", [])
+        # Auto-forget dismissals whose underlying reason no longer exists, so a
+        # resolved alert is removed (and re-alerts cleanly if it ever recurs).
+        pruned = [s for s in dismissed if s in live_sigs]
+        if pruned != dismissed:
+            D()["dismissed_alerts"] = pruned
+            dismissed = pruned
+            save()
+
+        visible = [n for n in notifs if _alert_sig(n) not in dismissed]
+        n_alerts = len(visible)
+        title = f"⚠️ Alerts ({n_alerts})" if n_alerts else "✅ Alerts (0)"
+        # An expander is a dropdown that opens client-side — no rerun, so the
+        # page keeps its scroll position when the user opens it.
+        with st.expander(title, expanded=st.session_state.get("alerts_open", False)):
+            if visible:
+                st.caption("Press Clear to dismiss an alert. It returns "
+                           "automatically if the condition changes or recurs.")
+                for note in visible:
+                    icon, cat, proj, details = note
+                    a1, a2 = st.columns([0.86, 0.14])
+                    a1.markdown(f"{icon} **{cat}** — {proj}  \n{details}")
+                    if a2.button("Clear", key=f"alert_clr_{_alert_sig(note)}"):
+                        D().setdefault("dismissed_alerts", []).append(_alert_sig(note))
+                        st.session_state["alerts_open"] = True
+                        save()
+                        st.rerun()
+            else:
+                st.success("No alerts — all clear!")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -444,13 +473,16 @@ elif page == "Project View":
     if st.session_state.get("proj_select") not in projects:
         st.session_state.pop("proj_select", None)
 
-    col1, col2, col3 = st.columns([3, 1, 1])
+    col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
     with col1:
         active = st.selectbox("Active Project", projects, key="proj_select")
     with col2:
         if st.button("➕ Add Project"):
             st.session_state.show_add_project = True
     with col3:
+        if st.button("✏️ Edit Project"):
+            st.session_state.show_edit_project = True
+    with col4:
         if st.button("🗑️ Remove Project", type="secondary"):
             if len(projects) > 1:
                 st.session_state.confirm_del_proj = True
@@ -501,6 +533,54 @@ elif page == "Project View":
                         st.error(f"'{new_name}' already exists.")
                 else:
                     st.error("Both code and name are required.")
+
+    # Edit project dialog (rename + change code)
+    if st.session_state.get("show_edit_project") and active in pr:
+        with st.expander(f"✏️ Edit '{active}'", expanded=True):
+            ec, en = st.columns(2)
+            edit_code = ec.text_input("Project Code",
+                                      value=pr[active].get("code", ""),
+                                      key=f"edit_code_{active}")
+            edit_name = en.text_input("Project Name", value=active,
+                                      key=f"edit_name_{active}")
+            eb1, eb2, _ = st.columns([1, 1, 3])
+            if eb1.button("💾 Save Changes", type="primary", key=f"edit_save_{active}"):
+                new_code = edit_code.strip()
+                new_name = edit_name.strip()
+                if not new_code or not new_name:
+                    st.error("Both code and name are required.")
+                elif new_name != active and new_name in pr:
+                    st.error(f"'{new_name}' already exists.")
+                else:
+                    pr[active]["code"] = new_code
+                    if new_name != active:
+                        # Move the record, then repoint every reference that
+                        # keys off the project name.
+                        pr[new_name] = pr.pop(active)
+                        for rec in D().get("invoices", []):
+                            if rec.get("project") == active:
+                                rec["project"] = new_name
+                        scbf = D().setdefault("student_credits_by_fy", {})
+                        for recs in scbf.values():
+                            for s in recs:
+                                if s.get("project") == active:
+                                    s["project"] = new_name
+                        D()["student_credits"] = [
+                            s for recs in scbf.values() for s in recs]
+                        for t in D().get("tools", []):
+                            sa = t.get("split_amounts")
+                            if isinstance(sa, dict) and active in sa:
+                                sa[new_name] = sa.pop(active)
+                        # Land on the renamed project after rerun.
+                        st.session_state["_new_project_name"] = new_name
+                        st.session_state.pop(f"view_fy_{active}", None)
+                    st.session_state.show_edit_project = False
+                    save()
+                    st.toast(f"Saved {new_name}")
+                    st.rerun()
+            if eb2.button("Cancel", key=f"edit_cancel_{active}"):
+                st.session_state.show_edit_project = False
+                st.rerun()
 
     if active not in pr:
         st.stop()
