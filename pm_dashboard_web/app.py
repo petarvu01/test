@@ -5,8 +5,8 @@ import numpy as np
 import json
 import base64
 from pathlib import Path
-from datetime import date
-from helpers import (parse_date, fmt_date, fy_label, date_to_fy,
+from datetime import date, timedelta, datetime
+from helpers import (parse_date, fmt_date, fy_label, date_to_fy, fy_range,
                      calc_payment_due, calc_renewal_date, calc_tool_costs)
 from data import (load_data, save_data, blank_project, blank_line,
                   compute_master_totals, project_contracted_total,
@@ -34,11 +34,429 @@ def D():
     return st.session_state.data
 
 
+# ─── Student-hours store (its own Gist; separate from main data) ──────────
+import requests as _requests
+
+HOURS_FILENAME = "student_hours.json"
+
+
+def _hours_cfg():
+    """(token, gist_id) for the student-hours Gist from secrets, or (None,None)."""
+    try:
+        sec = st.secrets["student_hours"]
+        return sec.get("token"), sec.get("gist_id")
+    except Exception:
+        return None, None
+
+
+def hours_configured() -> bool:
+    t, g = _hours_cfg()
+    return bool(t and g)
+
+
+def _hours_fetch() -> dict:
+    """Read the hours Gist fresh. Returns {} if empty, None on failure."""
+    t, g = _hours_cfg()
+    if not t or not g:
+        return None
+    try:
+        r = _requests.get(
+            f"https://api.github.com/gists/{g}",
+            headers={"Authorization": f"token {t}",
+                     "Accept": "application/vnd.github+json"}, timeout=10)
+        if r.status_code != 200:
+            return None
+        f = r.json().get("files", {}).get(HOURS_FILENAME)
+        if not f:
+            return {}
+        content = f.get("content", "")
+        if f.get("truncated") and f.get("raw_url"):
+            content = _requests.get(f["raw_url"], timeout=10).text
+        content = (content or "").strip()
+        return json.loads(content) if content else {}
+    except Exception:
+        return None
+
+
+def _hours_write(data: dict) -> int:
+    """PATCH the hours Gist. Returns the HTTP status code (or -1 on exception)."""
+    t, g = _hours_cfg()
+    if not t or not g:
+        return 0
+    try:
+        r = _requests.patch(
+            f"https://api.github.com/gists/{g}",
+            headers={"Authorization": f"token {t}",
+                     "Accept": "application/vnd.github+json"},
+            json={"files": {HOURS_FILENAME: {"content": json.dumps(data, indent=2)}}},
+            timeout=10)
+        return r.status_code
+    except Exception:
+        return -1
+
+
+def load_hours() -> dict:
+    fetched = _hours_fetch()
+    return fetched if isinstance(fetched, dict) else {}
+
+
+def H():
+    if "hours_data" not in st.session_state:
+        st.session_state.hours_data = load_hours()
+    return st.session_state.hours_data
+
+
+def save_hours(updater):
+    """Read the hours Gist fresh, apply `updater(dict)` in place, then write —
+    so the admin and the hours account never overwrite each other."""
+    if st.session_state.get("role") not in ("editor", "hours"):
+        st.toast("This account can't change hours.", icon="👁️")
+        return False
+    fresh = _hours_fetch()
+    if fresh is None:
+        st.toast("⚠️ Couldn't reach the hours store — not saved.", icon="⚠️")
+        return False
+    updater(fresh)
+    status = _hours_write(fresh)
+    ok = status == 200
+    st.session_state.hours_data = fresh
+    if not ok:
+        hint = {
+            401: "bad token (401)",
+            403: "token is missing the 'gist' scope (403)",
+            404: "wrong gist_id, or this token doesn't own that Gist (404)",
+            422: "request rejected by GitHub (422)",
+            -1: "network error",
+        }.get(status, f"HTTP {status}")
+        st.toast(f"⚠️ Hours save failed — {hint}. Check the [student_hours] "
+                 "token & gist_id.", icon="⚠️")
+    return ok
+
+
+# ─── Roster readers (from the main Gist's Student Workers list) ───────────
+def _roster_cols(df):
+    """Map the roster's columns to (project, project_id, student_id, first, last)
+    by case-insensitive header matching."""
+    low = {str(c).strip().lower(): c for c in df.columns}
+
+    def pick(*tests):
+        for lc, orig in low.items():
+            if any(t(lc) for t in tests):
+                return orig
+        return None
+    proj_id = pick(lambda s: "project" in s and "id" in s)
+    proj = pick(lambda s: "project" in s and "id" not in s)
+    stud_id = pick(lambda s: "student" in s and "id" in s,
+                   lambda s: s == "id")
+    first = pick(lambda s: "first" in s)
+    last = pick(lambda s: "last" in s)
+    role = pick(lambda s: "role" in s, lambda s: "title" in s,
+                lambda s: "position" in s)
+    return proj, proj_id, stud_id, first, last, role
+
+
+def roster_df_for_fy(fy):
+    sw = D().get("student_workers", {})
+    target = _fy_year_of(fy)
+    for key, rec in sw.items():
+        if _fy_year_of(key) == target:
+            return store_to_df(rec)
+    return pd.DataFrame()
+
+
+def student_master_for_fy(fy):
+    """Distinct students for a fiscal year (deduped by Student ID) from the
+    Student Workers sheet — just the people: sid, name, role."""
+    df = roster_df_for_fy(fy)
+    if df.empty:
+        return []
+    _, _, cSID, cF, cL, cR = _roster_cols(df)
+    seen = {}
+    for _, r in df.iterrows():
+        def g(c):
+            return "" if c is None or pd.isna(r[c]) else str(r[c]).strip()
+        sid = g(cSID)
+        if not sid or sid in seen:
+            continue
+        name = " ".join(x for x in (g(cF), g(cL)) if x).strip()
+        seen[sid] = {"sid": sid, "name": name or sid, "role": g(cR)}
+    return sorted(seen.values(), key=lambda s: s["name"].lower())
+
+
+def real_projects(fy):
+    """Project names active in the fiscal year, from Project View."""
+    return sorted([name for name, proj in D().get("project_records", {}).items()
+                   if project_in_fy(proj, fy)], key=str.lower)
+
+
+def assigned_sids(fy, pname):
+    """Student IDs assigned to a project for a FY (from the hours Gist)."""
+    return list(H().get("assignments", {}).get(fy, {}).get(pname, []))
+
+
+def set_assignment(fy, pname, sids):
+    """Admin: set a project's team for a FY (writes to the hours Gist)."""
+    def _upd(hd):
+        a = hd.setdefault("assignments", {}).setdefault(fy, {})
+        if sids:
+            a[pname] = list(dict.fromkeys(sids))   # de-dup, keep order
+        else:
+            a.pop(pname, None)
+    return save_hours(_upd)
+
+
+def student_projects(fy, sid):
+    """Projects a student is assigned to this FY (for the multi-project view)."""
+    amap = H().get("assignments", {}).get(fy, {})
+    return [p for p, sids in amap.items() if sid in sids]
+
+
+def _range_label(a: date, b: date) -> str:
+    """Compact date range, e.g. 'Jun 6–12' or 'Jun 30 – Jul 6'."""
+    if a.month == b.month:
+        return f"{a:%b} {a.day}–{b.day}"
+    return f"{a:%b} {a.day} – {b:%b} {b.day}"
+
+
+def fy_weeks(fy_lbl):
+    """Saturday→Friday weeks of a fiscal year (June 1 → May 31), kept entirely
+    inside the year. If the FY doesn't begin on a Saturday, the leading days are
+    folded into the first full week; if it doesn't end on a Friday, the trailing
+    days are folded into the last full week — those become 'extended' weeks.
+    Returns a list of (saturday_key, display_start, display_end, is_extended)."""
+    fy_s, fy_e = fy_range(fy_lbl)
+    if not fy_s:
+        return []
+    first_sat = fy_s + timedelta(days=(5 - fy_s.weekday()) % 7)   # 1st Sat ≥ start
+    last_fri = fy_e - timedelta(days=(fy_e.weekday() - 4) % 7)    # last Fri ≤ end
+    last_sat = last_fri - timedelta(days=6)
+    out, w = [], first_sat
+    while w <= last_sat:
+        ds, de, ext = w, w + timedelta(days=6), False
+        if w == first_sat and fy_s < first_sat:
+            ds, ext = fy_s, True                 # fold leading days in
+        if w == last_sat and fy_e > de:
+            de, ext = fy_e, True                 # fold trailing days in
+        out.append((w, ds, de, ext))
+        w += timedelta(days=7)
+    return out
+
+
+def render_hours_grid(fy):
+    """Editable weekly-hours grid for a project's assigned team — rolling 4-week
+    window (selected week + 3 prior). Writes to the [student_hours] Gist.
+    Shared by the Hours Logger (3rd account) and admin Student Hours tab."""
+    if not hours_configured():
+        st.error("The hours store isn't set up yet. Add a **[student_hours]** "
+                 "section (gist_id + token) in the app's Secrets.")
+        return
+    projects = real_projects(fy)
+    if not projects:
+        st.info(f"No projects are active in {fy}. Create them in Project View first.")
+        return
+    master = {s["sid"]: s for s in student_master_for_fy(fy)}
+
+    pname = st.selectbox("Project", projects, key=f"hrs_proj_{fy}")
+    sids = assigned_sids(fy, pname)
+    if not sids:
+        if can_edit():
+            st.info(f"No team is assigned to **{pname}** for {fy} yet. "
+                    "Assign students in the Team assignments section above.")
+        else:
+            st.info(f"No team is assigned to **{pname}** for {fy} yet. "
+                    "Ask the admin to assign the team.")
+        return
+    students = [master.get(sid, {"sid": sid, "name": sid, "role": ""}) for sid in sids]
+
+    # Saturday week picker bounded to the FY. The first/last weeks may be
+    # 'extended' (they absorb FY-boundary days that don't fall on Sat/Fri).
+    weeks = fy_weeks(fy)
+    if not weeks:
+        st.error("Couldn't work out the weeks for this fiscal year.")
+        return
+    ext_set = {w.strftime("%Y-%m-%d") for w, ds, de, ext in weeks if ext}
+    today = date.today()
+    default_idx = len(weeks) - 1
+    for idx, (w, ds, de, ext) in enumerate(weeks):
+        if ds <= today <= de:
+            default_idx = idx
+            break
+    opt_labels = [_range_label(ds, de) + ("   ⤢ extended week" if ext else "")
+                  for w, ds, de, ext in weeks]
+    sel_label = st.selectbox(
+        "Week to log (Saturday start — bounded to this fiscal year)",
+        opt_labels, index=default_idx, key=f"hrs_week_{fy}")
+    sel_index = opt_labels.index(sel_label)
+    sel_sat, sel_ds, sel_de, sel_ext = weeks[sel_index]
+    if sel_ext:
+        st.info(f"⤢ Extended week {_range_label(sel_ds, sel_de)} "
+                f"({sel_ds:%Y-%m-%d} → {sel_de:%Y-%m-%d}) — the fiscal year "
+                "doesn't start on a Saturday / end on a Friday, so the boundary "
+                "days are folded into this week.")
+
+    # Rolling 4-week window: the selected week plus the 3 weeks before it.
+    window = weeks[max(0, sel_index - 3): sel_index + 1]
+    win_weeks = [w.strftime("%Y-%m-%d") for w, ds, de, ext in window]
+    st.caption(f"Showing the rolling 4 weeks ending **{_range_label(sel_ds, sel_de)}**. "
+               "“FY total” counts every week logged this year for this project.")
+
+    hroot = H().get("hours", {}).get(fy, {}).get(pname, {})
+
+    # Build grid: Student ID + Name + Role (read-only) + 4 week cols + FY total.
+    rows = []
+    for s in students:
+        rec = hroot.get(s["sid"], {})
+        row = {"Student ID": s["sid"], "Name": s["name"], "Role": s.get("role", "")}
+        for w in win_weeks:
+            row[w] = float(rec.get(w, 0.0))
+        row["FY total"] = float(sum(rec.values()))   # all weeks, not just shown
+        rows.append(row)
+    grid = pd.DataFrame(rows)
+
+    # Map each Saturday key to its display range for headers/labels.
+    wk_disp = {w.strftime("%Y-%m-%d"): (ds, de) for w, ds, de, ext in weeks}
+
+    def _wk_header(w):
+        ds_de = wk_disp.get(w)
+        base = _range_label(*ds_de) if ds_de else w
+        return ("⤢ " + base) if w in ext_set else base
+    week_cfg = {w: st.column_config.NumberColumn(
+        _wk_header(w), help=f"Week of {w}"
+        + (" (extended — folds in FY-boundary days)" if w in ext_set else " (Sat–Fri)"),
+        min_value=0.0, step=0.5, format="%g") for w in win_weeks}
+    edited = st.data_editor(
+        grid, use_container_width=True, hide_index=True, num_rows="fixed",
+        key=f"hrs_grid_{fy}_{pname}_{'_'.join(win_weeks)}",
+        disabled=["Student ID", "Name", "Role", "FY total"],
+        column_config={
+            "Student ID": st.column_config.TextColumn("Student ID"),
+            "Name": st.column_config.TextColumn("Name"),
+            "Role": st.column_config.TextColumn("Role"),
+            "FY total": st.column_config.NumberColumn(
+                "FY total", help="This student's total hours for the whole FY on "
+                "this project (all weeks).", format="%g"),
+            **week_cfg,
+        },
+    )
+
+    # KPI cards are for the admin only — the hours logger just enters hours.
+    if can_edit():
+        # Live overlay: saved hours + whatever is currently typed in the visible
+        # window, so the KPIs reflect edits before saving.
+        live = {}
+        for _, r in edited.iterrows():
+            live[str(r["Student ID"])] = {w: float(r[w] or 0) for w in win_weeks}
+
+        def hours_for(week_keys):
+            tot = 0.0
+            for sid in set(list(hroot.keys()) + list(live.keys())):
+                rec = dict(hroot.get(sid, {}))
+                rec.update(live.get(sid, {}))
+                tot += sum(rec.get(w, 0) or 0 for w in week_keys)
+            return tot
+
+        # Fixed bi-weekly bucket (FY weeks paired from the start, NOT rolling).
+        b = sel_index // 2
+        bw = weeks[2 * b: 2 * b + 2]
+        bw_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in bw]
+        bw_lbl = (_range_label(bw[0][1], bw[-1][2]) if bw else "—")
+
+        # Calendar month of the selected week (by its Saturday key).
+        month_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in weeks
+                      if (w.year, w.month) == (sel_sat.year, sel_sat.month)]
+        all_fy_keys = [w.strftime("%Y-%m-%d") for w, ds, de, ext in weeks]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Team size", len(students))
+        c2.metric(f"Bi-weekly ({bw_lbl})", f"{hours_for(bw_keys):g}")
+        c3.metric(f"{sel_sat:%B} hours", f"{hours_for(month_keys):g}")
+        c4.metric(f"{pname} — FY total", f"{hours_for(all_fy_keys):g}")
+
+    if st.button("💾 Save hours", type="primary", key=f"hrs_save_{fy}_{pname}"):
+        def _upd(hd):
+            root = (hd.setdefault("hours", {}).setdefault(fy, {})
+                    .setdefault(pname, {}))
+            total = 0.0
+            for _, r in edited.iterrows():
+                sid = str(r["Student ID"])
+                rec = root.setdefault(sid, {})
+                for w in win_weeks:
+                    try:
+                        val = float(r[w]) if r[w] not in (None, "") else 0.0
+                    except (TypeError, ValueError):
+                        val = 0.0
+                    if val > 0:
+                        rec[w] = val
+                        total += val
+                    elif w in rec:
+                        del rec[w]
+                if not rec:
+                    root.pop(sid, None)
+            log = hd.setdefault("log", [])
+            log.append({
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "fy": fy, "pname": pname,
+                "students": len(students), "total": round(total, 2),
+                "by": st.session_state.get("role", "?"),
+            })
+            del log[:-50]
+        if save_hours(_upd):
+            st.toast("Hours saved")
+            st.rerun()
+
+
+def render_team_assignment(fy):
+    """Admin: assign each project's team for a FY from the student master list."""
+    projects = real_projects(fy)
+    master = student_master_for_fy(fy)
+    if not projects:
+        st.info("No projects in this fiscal year yet — add them in Project View.")
+        return
+    if not master:
+        st.info("No students found for this FY. Add the student list on the "
+                "Student Workers tab (Student ID, First/Last name, Role).")
+        return
+    pname = st.selectbox("Project to staff", projects, key=f"assign_proj_{fy}")
+    options = {}
+    for s in master:
+        lbl = f'{s["name"]} ({s["sid"]})' + (f' — {s["role"]}' if s["role"] else "")
+        options[lbl] = s["sid"]
+    current = set(assigned_sids(fy, pname))
+    default_labels = [lbl for lbl, sid in options.items() if sid in current]
+    chosen = st.multiselect(f"Team on {pname}", list(options.keys()),
+                            default=default_labels, key=f"assign_ms_{fy}_{pname}")
+    if st.button("💾 Save team", type="primary", key=f"assign_save_{fy}_{pname}"):
+        sids = [options[l] for l in chosen]
+        if set_assignment(fy, pname, sids):
+            st.toast(f"Saved {len(sids)} students to {pname}")
+            st.rerun()
+
+
+def hours_activity_alerts(days: int = 7):
+    """Recent hours submissions as (icon, category, project, details) tuples,
+    for the admin's Overview alert panel."""
+    out = []
+    log = H().get("log", []) if hours_configured() else []
+    cutoff = datetime.now() - timedelta(days=days)
+    for e in log:
+        try:
+            when = datetime.strptime(e.get("ts", ""), "%Y-%m-%d %H:%M")
+        except Exception:
+            continue
+        if when < cutoff:
+            continue
+        out.append(("⏱️", "Hours logged", e.get("pname", "—"),
+                    f"{e.get('students', 0)} students · {e.get('total', 0):g} hrs "
+                    f"· {e.get('fy', '')} — {e.get('ts', '')}"))
+    return list(reversed(out))   # newest first
+
+
 # ─── Accounts / roles ────────────────────────────────────────────────────
 # Two accounts: a privileged editor and a read-only viewer. Passwords are read
 # from Streamlit secrets ([auth] editor_password / viewer_password) when set,
 # otherwise these defaults apply — change them in secrets for real security.
-ACCOUNTS = {"Privileged (full access)": "editor", "View only": "viewer"}
+ACCOUNTS = {"Privileged (full access)": "editor", "View only": "viewer",
+            "Hours logger": "hours"}
 
 
 def _account_pw(secret_key: str, default: str) -> str:
@@ -51,6 +469,7 @@ def _account_pw(secret_key: str, default: str) -> str:
 _PASSWORDS = {
     "editor": _account_pw("editor_password", "pm-admin"),
     "viewer": _account_pw("viewer_password", "pm-view"),
+    "hours": _account_pw("hours_password", "pm-hours"),
 }
 
 
@@ -73,6 +492,49 @@ def save():
 
 def projects_sorted():
     return sorted(D()["project_records"].keys())
+
+
+def tool_fy_months(tool: dict, fy_lbl: str) -> int:
+    """Number of full monthly cycles a Monthly tool is active within a fiscal
+    year. Counts by calendar month (the start month counts as a full month),
+    bounded by the FY window and the tool's own start/end dates."""
+    fy_s, fy_e = fy_range(fy_lbl)
+    if not fy_s:                       # "All" or unparseable → treat as full year
+        return 12
+    t_start = parse_date(tool.get("start_date", ""))
+    t_end = parse_date(tool.get("end_date", ""))
+    start = max(t_start, fy_s) if t_start else fy_s
+    end = min(t_end, fy_e) if t_end else fy_e
+    if end < start:
+        return 0
+    return (end.year - start.year) * 12 + (end.month - start.month) + 1
+
+
+def tool_onetime_in_fy(tool: dict, fy_lbl: str) -> bool:
+    """A One-time tool's cost belongs to the single FY of its start date."""
+    fy_s, _ = fy_range(fy_lbl)
+    if not fy_s:
+        return True
+    t_start = parse_date(tool.get("start_date", ""))
+    if not t_start:
+        return True
+    return date_to_fy(t_start) == date_to_fy(fy_s)
+
+
+def tool_fy_amount_for_project(tool: dict, project: str, fy_lbl: str) -> float:
+    """A project's prorated cost for this tool in the selected FY.
+    Monthly → monthly split × active months in the FY.
+    One-time → the one-time split, but only in its start-date FY (else 0)."""
+    split = tool_split_for(D(), tool, project)   # billing-cycle units
+    if tool.get("billing_cycle") == "Monthly":
+        return split * tool_fy_months(tool, fy_lbl)
+    return split if tool_onetime_in_fy(tool, fy_lbl) else 0.0
+
+
+def tool_fy_total(tool: dict, fy_lbl: str) -> float:
+    """The tool's total prorated cost across all assigned projects for the FY."""
+    return sum(tool_fy_amount_for_project(tool, p, fy_lbl)
+               for p in tool_users(D(), tool.get("name", "")))
 
 
 def line_value(row, idx, default=0.0):
@@ -397,7 +859,19 @@ with st.sidebar:
                 'letter-spacing: 0.08em; padding: 0 4px; margin-bottom: 6px;">MAIN</div>',
                 unsafe_allow_html=True)
 
-    for icon, label in NAV_ITEMS:
+    # Role-scoped navigation
+    _role = st.session_state.get("role")
+    if _role == "hours":
+        nav_items = [("⏱️", "Hours Logger")]
+    elif _role == "editor":
+        nav_items = NAV_ITEMS + [("⏱️", "Student Hours")]
+    else:
+        nav_items = NAV_ITEMS
+    _valid = [lbl for _, lbl in nav_items]
+    if st.session_state.page not in _valid:
+        st.session_state.page = _valid[0]
+
+    for icon, label in nav_items:
         is_active = st.session_state.page == label
         # Active state styling via markdown + button combo
         if is_active:
@@ -419,7 +893,8 @@ with st.sidebar:
 
     # ── Signed-in account + sign out (login happens on the centered gate) ──
     role = st.session_state.get("role")
-    badge = "🔑 Privileged" if role == "editor" else "👁️ View only"
+    badge = ({"editor": "🔑 Privileged", "viewer": "👁️ View only",
+              "hours": "⏱️ Hours logger"}).get(role, role or "")
     st.markdown(f"""
     <div style="display: flex; align-items: center; gap: 8px; padding: 4px;">
         <div style="width: 28px; height: 28px; border-radius: 50%;
@@ -434,17 +909,21 @@ with st.sidebar:
         st.session_state.pop("login_pw", None)
         st.rerun()
 
-    # Storage status + manual backup
-    if gist_configured():
-        st.caption("💾 Cloud storage: on (Gist)")
+    # Storage status + manual backup (not for the locked-down hours account)
+    if role != "hours":
+        if gist_configured():
+            st.caption("💾 Cloud storage: on (Gist)")
+        else:
+            st.caption("⚠️ Local only — data resets on redeploy")
+        st.download_button(
+            "⬇️ Download backup (JSON)",
+            json.dumps(st.session_state.data, indent=2),
+            "dashboard_progress.json", "application/json",
+            use_container_width=True, key="sidebar_backup",
+        )
     else:
-        st.caption("⚠️ Local only — data resets on redeploy")
-    st.download_button(
-        "⬇️ Download backup (JSON)",
-        json.dumps(st.session_state.data, indent=2),
-        "dashboard_progress.json", "application/json",
-        use_container_width=True, key="sidebar_backup",
-    )
+        st.caption("⏱️ Hours store: "
+                   + ("on" if hours_configured() else "not configured"))
 
 page = st.session_state.page
 
@@ -543,6 +1022,9 @@ if page == "Overview":
 
     with col_right:
         notifs = get_all_notifications(D())
+        # Admin also gets alerts when the hours logger submits new hours.
+        if can_edit():
+            notifs = list(notifs) + hours_activity_alerts()
 
         # A stable signature per alert lets us remember which ones were cleared.
         def _alert_sig(note):
@@ -1820,13 +2302,11 @@ elif page == "Tools":
             mc, ac = calc_tool_costs(t)
             renewal = calc_renewal_date(t)
             n_users = count_tool_users(D(), t.get("name", ""))
-            if n_users <= 0:
-                per_proj = "—"
-            elif tool_has_custom_split(D(), t):
-                per_proj = "custom"
-            else:
-                per_proj = f"${ac / n_users:,.2f}"
+            fy_total = tool_fy_total(t, tool_fy)
+            fy_cell = f"${fy_total:,.2f}" if n_users else "—"
             tool_data.append({
+                "🔍": False,
+                "⚙️": False,
                 "Tool": t.get("name", ""),
                 "Vendor": t.get("vendor", ""),
                 "Cost": f"${t.get('cost', 0):,.2f}",
@@ -1834,7 +2314,7 @@ elif page == "Tools":
                 "Monthly": f"${mc:,.2f}" if t.get("billing_cycle") == "Monthly" else "—",
                 "Annual": f"${ac:,.2f}",
                 "Used by": f"{n_users}" if n_users else "—",
-                "Per project / yr": per_proj,
+                f"{tool_fy} total": fy_cell,
                 "Start": fmt_date(t.get("start_date", "")),
                 "End": fmt_date(t.get("end_date", "")) if t.get("end_date") else "ongoing",
                 "Next Renewal": fmt_date(renewal) if renewal else "—",
@@ -1842,45 +2322,105 @@ elif page == "Tools":
                 "Paid": "☑" if t.get("paid") else "☐",
                 "Notes": t.get("notes", ""),
             })
-        event = st.dataframe(
-            pd.DataFrame(tool_data), use_container_width=True, hide_index=True,
-            on_select="rerun", selection_mode="single-row", key="tools_table",
+        VIEW_COL, ACT_COL = "🔍", "⚙️"
+        df_tools = pd.DataFrame(tool_data)
+        gen = st.session_state.get("tools_table_gen", 0)
+        # 🔍 is always editable (viewers can inspect); ⚙️ only for editors.
+        disabled_cols = [c for c in df_tools.columns
+                         if not (c == VIEW_COL or (c == ACT_COL and can_edit()))]
+        edited = st.data_editor(
+            df_tools, use_container_width=True, hide_index=True, num_rows="fixed",
+            key=f"tools_table_{tool_fy}_{gen}", disabled=disabled_cols,
             column_config={
+                VIEW_COL: st.column_config.CheckboxColumn(
+                    VIEW_COL, width="small",
+                    help="Tick to show this tool's per-project breakdown for the "
+                         "selected fiscal year."),
+                ACT_COL: st.column_config.CheckboxColumn(
+                    ACT_COL, width="small",
+                    help="Tick to manage this tool — toggle Paid, delete, or set "
+                         "its cost split."),
                 "Notes": st.column_config.TextColumn(
                     "Notes", width="large",
                     help="Drag the column border to widen, or scroll the table "
-                         "sideways to read the full note.",
-                ),
+                         "sideways to read the full note."),
             },
         )
+        st.caption("Tick **🔍** to view a tool's per-project breakdown, or **⚙️** "
+                   "to manage it (Paid / delete / cost split). They're independent.")
 
-        # Toggle paid / Delete on the selected row (map back to the real index)
-        sel = event.selection.rows
-        if sel and sel[0] < len(filtered):
-            i = filtered[sel[0]][0]
-            st.caption(f"Selected: **{tools[i].get('name', '')}**")
+        def _first_checked(col):
+            try:
+                vals = edited[col].tolist()
+            except Exception:
+                return None
+            for pos, v in enumerate(vals):
+                if bool(v) and pos < len(filtered):
+                    return pos
+            return None
+
+        view_pos = _first_checked(VIEW_COL)
+        act_pos = _first_checked(ACT_COL)
+
+        # ── 🔍 Per-project breakdown (read-only; available to viewers too) ──
+        if view_pos is not None:
+            vt = filtered[view_pos][1]
+            v_users = tool_users(D(), vt.get("name", ""))
+            v_cycle = vt.get("billing_cycle", "Monthly")
+            st.markdown(f"**{vt.get('name','')} — {tool_fy} breakdown**")
+            if v_users:
+                breakdown = []
+                for p in v_users:
+                    split = tool_split_for(D(), vt, p)
+                    amt = tool_fy_amount_for_project(vt, p, tool_fy)
+                    if v_cycle == "Monthly":
+                        breakdown.append({
+                            "Project": p, "Cycle": "Monthly",
+                            "Split / mo": f"${split:,.2f}",
+                            "Months in FY": tool_fy_months(vt, tool_fy),
+                            f"{tool_fy} amount": f"${amt:,.2f}",
+                        })
+                    else:
+                        breakdown.append({
+                            "Project": p, "Cycle": "One-time",
+                            "Split / mo": "—", "Months in FY": "—",
+                            f"{tool_fy} amount": f"${amt:,.2f}"
+                            if tool_onetime_in_fy(vt, tool_fy) else "— (other FY)",
+                        })
+                st.dataframe(pd.DataFrame(breakdown), use_container_width=True,
+                             hide_index=True)
+                st.caption(f"FY total across projects: "
+                           f"**${tool_fy_total(vt, tool_fy):,.2f}**. "
+                           "Monthly = split × active months this FY; "
+                           "one-time counts only in its start-date FY.")
+            else:
+                st.caption("Not assigned to any project yet.")
+
+        # ── ⚙️ Manage the selected tool (editors only) ──────────────────────
+        if can_edit() and act_pos is not None:
+            i = filtered[act_pos][0]
+            st.caption(f"Managing: **{tools[i].get('name', '')}**")
             b1, b2 = st.columns(2)
-            if can_edit() and b1.button("Toggle Paid ☐ ↔ ☑"):
+            if b1.button("Toggle Paid ☐ ↔ ☑"):
                 tools[i]["paid"] = not tools[i].get("paid", False)
                 save()
                 st.rerun()
-            if can_edit() and b2.button("🗑️ Delete Tool"):
+            if b2.button("🗑️ Delete Tool"):
                 st.session_state["confirm_del_tool"] = i
-            # Reset a pending confirmation if a different row got selected.
             if (st.session_state.get("confirm_del_tool") is not None
                     and st.session_state["confirm_del_tool"] != i):
                 st.session_state.pop("confirm_del_tool", None)
-            # Two-step confirmation so a tool is never removed by a stray click.
             if st.session_state.get("confirm_del_tool") == i:
                 st.warning(f"Remove **{tools[i].get('name', '')}**? "
                            "This can't be undone.")
                 cd1, cd2 = st.columns(2)
-                if can_edit() and cd1.button("✅ Yes, remove it", key=f"del_yes_{i}"):
+                if cd1.button("✅ Yes, remove it", key=f"del_yes_{i}"):
                     tools.pop(i)
                     st.session_state.pop("confirm_del_tool", None)
+                    st.session_state["tools_table_gen"] = gen + 1  # reset checks
                     save()
                     st.rerun()
-                if can_edit() and cd2.button("↩️ Cancel", key=f"del_no_{i}"):
+                if cd2.button("↩️ Cancel", key=f"del_no_{i}"):
                     st.session_state.pop("confirm_del_tool", None)
                     st.rerun()
 
@@ -1921,16 +2461,15 @@ elif page == "Tools":
                 else:
                     st.caption(f"✓ Matches the {cycle.lower()} cost (${cost:,.2f})")
                 sc1, sc2 = st.columns(2)
-                if can_edit() and sc1.button("💾 Save Split", key=f"save_split_{i}"):
+                if sc1.button("💾 Save Split", key=f"save_split_{i}"):
                     t_sel["split_amounts"] = {p: float(v) for p, v in amt_inputs.items()}
                     save()
                     st.toast("Custom $ split saved")
                     st.rerun()
-                if can_edit() and sc2.button("↩️ Reset to equal split", key=f"reset_split_{i}"):
+                if sc2.button("↩️ Reset to equal split", key=f"reset_split_{i}"):
                     t_sel["split_amounts"] = {}
                     save()
                     st.rerun()
-                # Preview of resulting annual shares (exactly as entered, annualized)
                 from data import _cycle_amount_to_monthly_annual
                 preview = []
                 for p, v in amt_inputs.items():
@@ -1944,8 +2483,6 @@ elif page == "Tools":
             elif len(users) == 1:
                 st.caption(f"Only **{users[0]}** uses this tool — it bears the full cost. "
                            "Assign the tool to more projects to split it.")
-        else:
-            st.caption("Click a row above to toggle Paid, delete, or set a cost split.")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -2107,3 +2644,95 @@ elif page == "Results":
             st.download_button("⬇️ Download CSV", csv,
                                f"results_per_project_{fy_a.replace(' ', '_')}_vs_{fy_b.replace(' ', '_')}.csv",
                                "text/csv")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# HOURS LOGGER  (3rd account — logs weekly student hours only)
+# ═════════════════════════════════════════════════════════════════════════
+elif page == "Hours Logger":
+    if st.session_state.get("role") not in ("hours", "editor"):
+        st.error("You don't have access to this page.")
+        st.stop()
+    st.title("⏱️ Weekly Hours")
+    st.caption("Pick a fiscal year and project, then enter each student worker's "
+               "hours for the week. Saved to the separate hours store.")
+    fy = st.selectbox("Fiscal Year", fy_choices(), key="hours_fy_logger")
+    render_hours_grid(fy)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# STUDENT HOURS  (admin — assign teams, view/edit hours, totals & roll-ups)
+# ═════════════════════════════════════════════════════════════════════════
+elif page == "Student Hours":
+    if not can_edit():
+        st.error("You don't have access to this page.")
+        st.stop()
+    st.title("⏱️ Student Hours Tracking")
+    fy = st.selectbox("Fiscal Year", fy_choices(), key="hours_fy_admin")
+
+    master = {s["sid"]: s for s in student_master_for_fy(fy)}
+    amap = H().get("assignments", {}).get(fy, {})
+    hroot = H().get("hours", {}).get(fy, {})
+
+    # ── Assign each project's team ──
+    st.subheader("Team assignments")
+    st.caption("Assign students to each project for this fiscal year. The hours "
+               "logger fills in weekly hours for whoever is on the team.")
+    render_team_assignment(fy)
+
+    st.divider()
+
+    # ── Per-student totals (live from hours data; survives roster changes) ──
+    st.subheader("Totals per student")
+    # Every student who appears in assignments OR has logged hours this FY.
+    all_sids = set(s for sids in amap.values() for s in sids)
+    for pproj in hroot.values():
+        all_sids.update(pproj.keys())
+    if all_sids:
+        rows = []
+        for sid in sorted(all_sids):
+            info = master.get(sid, {"name": sid, "role": ""})
+            per_proj = {p: sum(hroot.get(p, {}).get(sid, {}).values())
+                        for p in set(list(amap.keys()) + list(hroot.keys()))}
+            per_proj = {p: v for p, v in per_proj.items() if v or sid in amap.get(p, [])}
+            total = sum(per_proj.values())
+            breakdown = ", ".join(f"{p}: {v:g}" for p, v in sorted(per_proj.items()) if v)
+            rows.append({
+                "Student ID": sid, "Name": info.get("name", sid),
+                "Role": info.get("role", ""),
+                "# Projects": len([p for p in per_proj if per_proj[p] or sid in amap.get(p, [])]),
+                f"FY total ({fy})": f"{total:g}",
+                "By project": breakdown or "—",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No students assigned or logged yet for this fiscal year.")
+
+    # ── Students on more than one project (by Student ID) ──
+    multi = {sid: [p for p, sids in amap.items() if sid in sids] for sid in
+             set(s for sids in amap.values() for s in sids)}
+    multi = {sid: ps for sid, ps in multi.items() if len(ps) > 1}
+    if multi:
+        st.markdown("**On multiple projects:**")
+        mrows = [{"Student ID": sid,
+                  "Name": master.get(sid, {}).get("name", sid),
+                  "# Projects": len(ps), "Projects": ", ".join(sorted(ps))}
+                 for sid, ps in sorted(multi.items())]
+        st.dataframe(pd.DataFrame(mrows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Edit hours by project (rolling 4 weeks) ──
+    st.subheader("Hours by project")
+    render_hours_grid(fy)
+
+    # Recent submission activity from the hours logger.
+    log = H().get("log", []) if hours_configured() else []
+    if log:
+        with st.expander(f"🕘 Recent hours activity ({len(log)} entries)"):
+            recent = [{"When": e.get("ts", ""), "Project": e.get("pname", ""),
+                       "FY": e.get("fy", ""), "Students": e.get("students", 0),
+                       "Total hrs": e.get("total", 0), "By": e.get("by", "")}
+                      for e in reversed(log)]
+            st.dataframe(pd.DataFrame(recent), use_container_width=True,
+                         hide_index=True)

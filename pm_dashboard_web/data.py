@@ -120,13 +120,17 @@ def default_data():
 
 # ─── GitHub Gist storage (durable, survives Streamlit redeploys) ──────────
 def _gist_config():
-    """Return (token, gist_id) from Streamlit secrets or env vars; (None, None) if unset."""
+    """Return (token, gist_id) from Streamlit secrets or env vars; (None, None) if unset.
+    Looks under [pm_dashboard] first, then [github], so either section name works."""
     token = gist_id = None
     try:
         import streamlit as st
-        if "github" in st.secrets:
-            token = st.secrets["github"].get("token")
-            gist_id = st.secrets["github"].get("gist_id")
+        for section in ("pm_dashboard", "github"):
+            if section in st.secrets:
+                token = st.secrets[section].get("token")
+                gist_id = st.secrets[section].get("gist_id")
+                if token and gist_id:
+                    break
     except Exception:
         pass
     token = token or os.environ.get("GITHUB_TOKEN")
