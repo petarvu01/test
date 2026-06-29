@@ -1045,45 +1045,48 @@ if page == "Overview":
             st.info(f"No projects with contracted hours in {overview_fy}.")
 
     with col_right:
-        notifs = get_all_notifications(D())
-        # Admin also gets alerts when the hours logger submits new hours.
-        if can_edit():
+        # Alerts are hidden from the view-only account.
+        if not can_edit():
+            st.empty()
+        else:
+            notifs = get_all_notifications(D())
+            # Admin also gets alerts when the hours logger submits new hours.
             notifs = list(notifs) + hours_activity_alerts()
 
-        # A stable signature per alert lets us remember which ones were cleared.
-        def _alert_sig(note):
-            return "‖".join(str(x) for x in note)
+            # A stable signature per alert lets us remember which ones were cleared.
+            def _alert_sig(note):
+                return "‖".join(str(x) for x in note)
 
-        live_sigs = {_alert_sig(n) for n in notifs}
-        dismissed = D().get("dismissed_alerts", [])
-        # Auto-forget dismissals whose underlying reason no longer exists, so a
-        # resolved alert is removed (and re-alerts cleanly if it ever recurs).
-        pruned = [s for s in dismissed if s in live_sigs]
-        if pruned != dismissed:
-            D()["dismissed_alerts"] = pruned
-            dismissed = pruned
-            save()
+            live_sigs = {_alert_sig(n) for n in notifs}
+            dismissed = D().get("dismissed_alerts", [])
+            # Auto-forget dismissals whose underlying reason no longer exists, so a
+            # resolved alert is removed (and re-alerts cleanly if it ever recurs).
+            pruned = [s for s in dismissed if s in live_sigs]
+            if pruned != dismissed:
+                D()["dismissed_alerts"] = pruned
+                dismissed = pruned
+                save()
 
-        visible = [n for n in notifs if _alert_sig(n) not in dismissed]
-        n_alerts = len(visible)
-        title = f"⚠️ Alerts ({n_alerts})" if n_alerts else "✅ Alerts (0)"
-        # An expander is a dropdown that opens client-side — no rerun, so the
-        # page keeps its scroll position when the user opens it.
-        with st.expander(title, expanded=st.session_state.get("alerts_open", False)):
-            if visible:
-                st.caption("Press Clear to dismiss an alert. It returns "
-                           "automatically if the condition changes or recurs.")
-                for note in visible:
-                    icon, cat, proj, details = note
-                    a1, a2 = st.columns([0.86, 0.14])
-                    a1.markdown(f"{icon} **{cat}** — {proj}  \n{details}")
-                    if can_edit() and a2.button("Clear", key=f"alert_clr_{_alert_sig(note)}"):
-                        D().setdefault("dismissed_alerts", []).append(_alert_sig(note))
-                        st.session_state["alerts_open"] = True
-                        save()
-                        st.rerun()
-            else:
-                st.success("No alerts — all clear!")
+            visible = [n for n in notifs if _alert_sig(n) not in dismissed]
+            n_alerts = len(visible)
+            title = f"⚠️ Alerts ({n_alerts})" if n_alerts else "✅ Alerts (0)"
+            # An expander is a dropdown that opens client-side — no rerun, so the
+            # page keeps its scroll position when the user opens it.
+            with st.expander(title, expanded=st.session_state.get("alerts_open", False)):
+                if visible:
+                    st.caption("Press Clear to dismiss an alert. It returns "
+                               "automatically if the condition changes or recurs.")
+                    for note in visible:
+                        icon, cat, proj, details = note
+                        a1, a2 = st.columns([0.86, 0.14])
+                        a1.markdown(f"{icon} **{cat}** — {proj}  \n{details}")
+                        if a2.button("Clear", key=f"alert_clr_{_alert_sig(note)}"):
+                            D().setdefault("dismissed_alerts", []).append(_alert_sig(note))
+                            st.session_state["alerts_open"] = True
+                            save()
+                            st.rerun()
+                else:
+                    st.success("No alerts — all clear!")
 
 
 # ═════════════════════════════════════════════════════════════════════════
