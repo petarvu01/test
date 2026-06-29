@@ -146,10 +146,12 @@ def _roster_cols(df):
         return None
     proj_id = pick(lambda s: "project" in s and "id" in s)
     proj = pick(lambda s: "project" in s and "id" not in s)
-    stud_id = pick(lambda s: "student" in s and "id" in s,
-                   lambda s: s == "id")
-    first = pick(lambda s: "first" in s)
-    last = pick(lambda s: "last" in s)
+    stud_id = pick(lambda s: "student" in s and ("id" in s or "#" in s or "no" in s),
+                   lambda s: s in ("id", "sid", "studentid", "student", "student#",
+                                   "student no", "student number", "student id#"),
+                   lambda s: "id" in s and "project" not in s)
+    first = pick(lambda s: "first" in s, lambda s: s in ("fname", "f name"))
+    last = pick(lambda s: "last" in s, lambda s: s in ("lname", "l name", "surname"))
     role = pick(lambda s: "role" in s, lambda s: "title" in s,
                 lambda s: "position" in s)
     return proj, proj_id, stud_id, first, last, role
@@ -162,6 +164,28 @@ def roster_df_for_fy(fy):
         if _fy_year_of(key) == target:
             return store_to_df(rec)
     return pd.DataFrame()
+
+
+def roster_diag(fy):
+    """Human-readable reason the student list is empty for a FY (for the UI)."""
+    df = roster_df_for_fy(fy)
+    if df.empty:
+        sw = D().get("student_workers", {})
+        if sw:
+            yrs = ", ".join(sorted(set(str(k) for k in sw.keys())))
+            return ("No Student Workers sheet is saved for **this** fiscal year. "
+                    f"You have sheets saved for: {yrs}. Re-select that year, or "
+                    "upload the list under the year you're viewing.")
+        return ("No Student Workers sheet found at all. Upload it on the Student "
+                "Workers tab. If you did upload it, your changes may not have saved "
+                "to the Gist — check the storage status in the sidebar.")
+    _, _, cSID, cF, cL, cR = _roster_cols(df)
+    cols = ", ".join(str(c) for c in df.columns)
+    if cSID is None:
+        return (f"A sheet exists (columns: {cols}) but no **Student ID** column "
+                "was recognized. Rename the ID column to 'Student ID'.")
+    return (f"A sheet exists (columns: {cols}) with a Student ID column, but no "
+            "rows had a Student ID value filled in.")
 
 
 def student_master_for_fy(fy):
@@ -413,8 +437,8 @@ def render_team_assignment(fy):
         st.info("No projects in this fiscal year yet — add them in Project View.")
         return
     if not master:
-        st.info("No students found for this FY. Add the student list on the "
-                "Student Workers tab (Student ID, First/Last name, Role).")
+        st.warning("No students found for this fiscal year.")
+        st.info(roster_diag(fy))
         return
     pname = st.selectbox("Project to staff", projects, key=f"assign_proj_{fy}")
     options = {}
